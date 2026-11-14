@@ -219,9 +219,15 @@ fn run_nts_ke(args: &Args) -> ExitCode {
         keys.c2s.len(),
         keys.s2c.len()
     );
+    let t = keys.timings;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    println!("  Connected to      : {}", keys.peer);
     println!(
-        "  Took              : {:.1} ms",
-        elapsed.as_secs_f64() * 1e3
+        "  Took              : {:.1} ms (connect {:.1}, TLS {:.1}, records {:.1})",
+        ms(elapsed),
+        ms(t.connect),
+        ms(t.handshake),
+        ms(t.exchange)
     );
     ExitCode::SUCCESS
 }

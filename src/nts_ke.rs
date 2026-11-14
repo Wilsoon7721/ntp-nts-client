@@ -1,8 +1,10 @@
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -212,6 +214,15 @@ pub struct NtsKeys {
     pub ntp_port: u16,
     pub tls_version: String,
     pub cipher_suite: String,
+    pub peer: SocketAddr,
+    pub timings: KeTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeTimings {
+    pub connect: Duration,
+    pub handshake: Duration,
+    pub exchange: Duration,
 }
 
 impl fmt::Debug for NtsKeys {
@@ -233,7 +244,7 @@ pub enum KeError {
     InvalidName(String),
     Io(io::Error),
     Tls(rustls::Error),
-    Timeout,
+    Timeout(&'static str),
     AlpnMismatch,
     ServerError(u16),
     ServerWarning(u16),
@@ -248,7 +259,7 @@ impl fmt::Display for KeError {
             Self::InvalidName(h) => write!(f, "{h:?} is not a valid TLS server name"),
             Self::Io(e) => write!(f, "network/TLS error: {e}"),
             Self::Tls(e) => write!(f, "TLS error: {e}"),
-            Self::Timeout => write!(f, "timed out"),
+            Self::Timeout(phase) => write!(f, "timed out during {phase}"),
             Self::AlpnMismatch => write!(f, "server did not agree to ALPN \"ntske/1\""),
             Self::ServerError(c) => {
                 let what = match c {
@@ -271,10 +282,18 @@ impl std::error::Error for KeError {}
 impl From<io::Error> for KeError {
     fn from(e: io::Error) -> Self {
         match e.kind() {
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Self::Timeout,
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Self::Timeout("network I/O"),
             _ => Self::Io(e),
         }
     }
+}
+
+/// Labels a timeout with the phase it happened in.
+fn in_phase<T, E: Into<KeError>>(r: Result<T, E>, phase: &'static str) -> Result<T, KeError> {
+    r.map_err(|e| match e.into() {
+        KeError::Timeout(_) => KeError::Timeout(phase),
+        other => other,
+    })
 }
 
 impl From<rustls::Error> for KeError {
@@ -317,17 +336,10 @@ pub fn key_exchange(host: &str, port: u16, timeout: Duration) -> Result<NtsKeys,
         .to_socket_addrs()
         .map_err(|_| KeError::Resolve(host.into()))?
         .collect();
-    let mut last_err = KeError::Resolve(host.into());
-    let tcp = addrs
-        .iter()
-        .find_map(|addr| match TcpStream::connect_timeout(addr, timeout) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                last_err = e.into();
-                None
-            }
-        })
-        .ok_or(last_err)?;
+    let mut timings = KeTimings::default();
+    let start = Instant::now();
+    let (tcp, peer) = in_phase(connect_any(&addrs, timeout), "TCP connect")?;
+    timings.connect = start.elapsed();
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
 
@@ -335,16 +347,21 @@ pub fn key_exchange(host: &str, port: u16, timeout: Duration) -> Result<NtsKeys,
     let mut tls = StreamOwned::new(conn, tcp);
 
     // Finish the handshake first so ALPN is checked
+    let start = Instant::now();
     while tls.conn.is_handshaking() {
-        tls.conn.complete_io(&mut tls.sock)?;
+        in_phase(tls.conn.complete_io(&mut tls.sock), "TLS handshake")?;
     }
+    timings.handshake = start.elapsed();
     if tls.conn.alpn_protocol() != Some(ALPN) {
         return Err(KeError::AlpnMismatch);
     }
 
-    tls.write_all(&build_request())?;
-    tls.flush()?;
-    let response = parse_response(&read_records(&mut tls)?)?;
+    let start = Instant::now();
+    in_phase(tls.write_all(&build_request()), "sending request")?;
+    in_phase(tls.flush(), "sending request")?;
+    let records = in_phase(read_records(&mut tls), "waiting for response")?;
+    let response = parse_response(&records)?;
+    timings.exchange = start.elapsed();
 
     let c2s = export_key(&tls.conn, response.aead, 0)?;
     let s2c = export_key(&tls.conn, response.aead, 1)?;
@@ -371,7 +388,59 @@ pub fn key_exchange(host: &str, port: u16, timeout: Duration) -> Result<NtsKeys,
         ntp_port: response.ntp_port.unwrap_or(crate::client::DEFAULT_PORT),
         tls_version,
         cipher_suite,
+        peer,
+        timings,
     })
+}
+
+/// Happy Eyeballs (RFC 8305), simplified: start a connection attempt to the
+/// next address every 250 ms instead of waiting out the full timeout on an
+/// unreachable one, and use whichever connects first.
+fn connect_any(addrs: &[SocketAddr], timeout: Duration) -> io::Result<(TcpStream, SocketAddr)> {
+    const STAGGER: Duration = Duration::from_millis(250);
+    let done = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    for (i, addr) in interleave_families(addrs).into_iter().enumerate() {
+        let (tx, done) = (tx.clone(), done.clone());
+        thread::spawn(move || {
+            thread::sleep(STAGGER * i as u32);
+            if done.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(TcpStream::connect_timeout(&addr, timeout).map(|s| (s, addr)));
+        });
+    }
+    drop(tx);
+
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no addresses to connect to");
+    for result in rx {
+        match result {
+            Ok(winner) => {
+                done.store(true, Ordering::Relaxed);
+                return Ok(winner);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Alternates address families, starting with the resolver's first choice.
+fn interleave_families(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first() else {
+        return vec![];
+    };
+    let (mut preferred, mut other): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
+        .iter()
+        .partition(|a| a.is_ipv6() == first.is_ipv6());
+    preferred.reverse();
+    other.reverse();
+    let mut out = Vec::with_capacity(addrs.len());
+    while !preferred.is_empty() || !other.is_empty() {
+        out.extend(preferred.pop());
+        out.extend(other.pop());
+    }
+    out
 }
 
 /// Splits `host`, `host:port`, `[v6]:port` or a bare IPv6 address
@@ -504,6 +573,23 @@ mod tests {
         let mut recs = good_response();
         recs.insert(0, Record::new(false, 0x1234, vec![9, 9]));
         assert!(parse_response(&recs).is_ok());
+    }
+
+    #[test]
+    fn families_interleave() {
+        let a: Vec<SocketAddr> = ["[::1]:1", "[::2]:1", "1.1.1.1:1", "2.2.2.2:1", "3.3.3.3:1"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let order: Vec<String> = interleave_families(&a)
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            order,
+            ["[::1]:1", "1.1.1.1:1", "[::2]:1", "2.2.2.2:1", "3.3.3.3:1"]
+        );
+        assert!(interleave_families(&[]).is_empty());
     }
 
     #[test]
