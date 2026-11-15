@@ -1,4 +1,5 @@
 mod client;
+mod clock;
 mod nts;
 mod nts_ke;
 mod packet;
@@ -11,7 +12,7 @@ use client::{query_with, resolve, Plain, Protection, Sample};
 use packet::LeapIndicator;
 
 const USAGE: &str = "\
-Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts | --nts-ke]
+Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts-ke]
 
   SERVER   host, host:port, ip or [ipv6]:port (default: time.cloudflare.com)
   -n       number of samples, 2 s apart       (default: 4)
@@ -20,8 +21,10 @@ Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts | --nts-ke]
            then NTS-protected NTP to the server it names
   --nts-ke only run NTS key establishment against SERVER (port 4460) and
            show what was negotiated
+  --set    with --nts: step the system clock to the measured time
+           (needs an elevated/administrator terminal)
 
-Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. This does not change the system clock.";
+Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. The system clock is only changed with --set.";
 
 struct Args {
     server: String,
@@ -29,6 +32,7 @@ struct Args {
     timeout: Duration,
     nts: bool,
     nts_ke: bool,
+    set: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -38,6 +42,7 @@ fn parse_args() -> Result<Args, String> {
         timeout: Duration::from_secs(5),
         nts: false,
         nts_ke: false,
+        set: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -45,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => return Err(String::new()),
             "--nts" => args.nts = true,
             "--nts-ke" => args.nts_ke = true,
+            "--set" => args.set = true,
             "-n" => {
                 let v = it.next().ok_or("-n needs a value")?;
                 args.samples = v.parse().ok().filter(|&n| n > 0).ok_or("-n must be >= 1")?;
@@ -61,6 +67,9 @@ fn parse_args() -> Result<Args, String> {
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             s => args.server = s.into(),
         }
+    }
+    if args.set && !args.nts {
+        return Err("--set needs --nts: only authenticated time is used to set the clock".into());
     }
     Ok(args)
 }
@@ -139,6 +148,13 @@ error: no valid replies");
 }
 
 fn run_nts(args: &Args) -> ExitCode {
+    // Fail before any network work if we won't be allowed to set the clock
+    if args.set
+        && let Err(e) = clock::enable_privilege()
+    {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
     let (host, port) = match nts_ke::split_host_port(&args.server, nts_ke::DEFAULT_KE_PORT) {
         Ok(hp) => hp,
         Err(e) => {
@@ -188,6 +204,46 @@ fn run_nts(args: &Args) -> ExitCode {
         "  Authentication    : NTS (AEAD_AES_SIV_CMAC_256), {} cookies left",
         session.cookies_left()
     );
+    if args.set {
+        return set_clock(&best, addr, args, &mut session);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Steps the clock by the best sample's offset, then re-measures to confirm
+fn set_clock(
+    best: &Sample,
+    addr: std::net::SocketAddr,
+    args: &Args,
+    session: &mut nts::NtsSession,
+) -> ExitCode {
+    // SetSystemTime only has millisecond resolution
+    if best.offset.as_millis_f64().abs() < 1.0 {
+        println!("
+Clock is already within 1 ms, not changing it");
+        return ExitCode::SUCCESS;
+    }
+    match clock::step(best.offset) {
+        Ok(t) => println!(
+            "
+Stepped clock by {} to {}",
+            best.offset,
+            time::format_utc(t)
+        ),
+        Err(e) => {
+            eprintln!("
+error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match query_with(addr, args.timeout, session) {
+        Ok(s) => println!(
+            "Re-check: offset now {} (delay {:.3} ms)",
+            s.offset,
+            s.delay.as_millis_f64()
+        ),
+        Err(e) => println!("Re-check failed: {e}"),
+    }
     ExitCode::SUCCESS
 }
 
