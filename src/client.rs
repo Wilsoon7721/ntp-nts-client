@@ -9,12 +9,12 @@
 //! ```
 
 use std::fmt;
-use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::packet::{DecodeError, LeapIndicator, Mode, NtpPacket};
+use crate::nts::{random_bytes, NtsError};
+use crate::packet::{DecodeError, LeapIndicator, Mode, NtpPacket, HEADER_LEN};
 use crate::time::{NtpDuration, NtpTimestamp};
 
 pub const DEFAULT_PORT: u16 = 123;
@@ -44,6 +44,7 @@ pub enum ClientError {
     ServerUnsynchronized,
     InvalidStratum(u8),
     ZeroTransmitTimestamp,
+    Nts(NtsError),
 }
 
 impl fmt::Display for ClientError {
@@ -58,11 +59,18 @@ impl fmt::Display for ClientError {
             Self::ServerUnsynchronized => write!(f, "server reports its clock is unsynchronized"),
             Self::InvalidStratum(s) => write!(f, "invalid stratum {s}"),
             Self::ZeroTransmitTimestamp => write!(f, "reply has a zero transmit timestamp"),
+            Self::Nts(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for ClientError {}
+
+impl From<NtsError> for ClientError {
+    fn from(e: NtsError) -> Self {
+        Self::Nts(e)
+    }
+}
 
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
@@ -98,8 +106,34 @@ pub fn compute_offset_delay(
     (NtpDuration(offset as i64), delay)
 }
 
-/// Sends a client request to `server` and waits up to `timeout` for a valid reply
-pub fn query(server: SocketAddr, timeout: Duration) -> Result<Sample, ClientError> {
+/// Hook for adding security to requests on top of the plain exchange
+pub trait Protection {
+    /// Turns the 48-byte header into the bytes to send
+    fn request(&mut self, header: &[u8; HEADER_LEN]) -> Result<Vec<u8>, ClientError>;
+    /// Checks a reply whose origin timestamp already matched
+    fn verify(&mut self, packet: &NtpPacket, raw: &[u8]) -> Result<(), ClientError>;
+}
+
+/// Regular NTP
+pub struct Plain;
+
+impl Protection for Plain {
+    fn request(&mut self, header: &[u8; HEADER_LEN]) -> Result<Vec<u8>, ClientError> {
+        Ok(header.to_vec())
+    }
+
+    fn verify(&mut self, _: &NtpPacket, _: &[u8]) -> Result<(), ClientError> {
+        Ok(())
+    }
+}
+
+/// Sends a client request to `server` and waits up to `timeout` for a valid reply.
+/// `protection` builds the request and checks the reply ([`Plain`] for none).
+pub fn query_with(
+    server: SocketAddr,
+    timeout: Duration,
+    protection: &mut impl Protection,
+) -> Result<Sample, ClientError> {
     let bind: SocketAddr = if server.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -108,15 +142,16 @@ pub fn query(server: SocketAddr, timeout: Duration) -> Result<Sample, ClientErro
     let socket = UdpSocket::bind(bind)?;
     socket.connect(server)?;
 
-    let nonce = NtpTimestamp(RandomState::new().hash_one(Instant::now()));
-    let request = NtpPacket::client_request(nonce);
+    let nonce = NtpTimestamp(u64::from_be_bytes(random_bytes()?));
+    let request = protection.request(&NtpPacket::client_request(nonce).encode())?;
 
     let t1_wall = SystemTime::now();
     let t1_mono = Instant::now();
-    socket.send(&request.encode())?;
+    socket.send(&request)?;
 
     let deadline = t1_mono + timeout;
-    let mut buf = [0u8; 1024];
+    // NTS replies carrying 8 cookies are ~1 KB
+    let mut buf = [0u8; 4096];
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -130,6 +165,7 @@ pub fn query(server: SocketAddr, timeout: Duration) -> Result<Sample, ClientErro
         if response.origin_ts != nonce {
             continue; // stale or bogus reply; keep waiting for ours
         }
+        protection.verify(&response, &buf[..len])?;
         validate(&response)?;
 
         let t1 = NtpTimestamp::from_system_time(t1_wall);

@@ -1,4 +1,5 @@
 mod client;
+mod nts;
 mod nts_ke;
 mod packet;
 mod time;
@@ -6,24 +7,27 @@ mod time;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use client::{query, resolve, Sample};
+use client::{query_with, resolve, Plain, Protection, Sample};
 use packet::LeapIndicator;
 
 const USAGE: &str = "\
-Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts-ke]
+Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts | --nts-ke]
 
   SERVER   host, host:port, ip or [ipv6]:port (default: time.cloudflare.com)
   -n       number of samples, 2 s apart       (default: 4)
   -t       per-request timeout in seconds     (default: 5)
+  --nts    authenticate with NTS: key establishment on SERVER port 4460,
+           then NTS-protected NTP to the server it names
   --nts-ke only run NTS key establishment against SERVER (port 4460) and
            show what was negotiated
 
-Measures how far this machine's clock is from SERVER using plain NTP. This does not change the system clock.";
+Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. This does not change the system clock.";
 
 struct Args {
     server: String,
     samples: u32,
     timeout: Duration,
+    nts: bool,
     nts_ke: bool,
 }
 
@@ -32,12 +36,14 @@ fn parse_args() -> Result<Args, String> {
         server: "time.cloudflare.com".into(),
         samples: 4,
         timeout: Duration::from_secs(5),
+        nts: false,
         nts_ke: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => return Err(String::new()),
+            "--nts" => args.nts = true,
             "--nts-ke" => args.nts_ke = true,
             "-n" => {
                 let v = it.next().ok_or("-n needs a value")?;
@@ -74,6 +80,9 @@ fn main() -> ExitCode {
     if args.nts_ke {
         return run_nts_ke(&args);
     }
+    if args.nts {
+        return run_nts(&args);
+    }
 
     let addr = match resolve(&args.server) {
         Ok(a) => a,
@@ -83,18 +92,32 @@ fn main() -> ExitCode {
         }
     };
     println!(
-        "Querying {} ({addr}), {} sample(s)\n",
+        "Querying {} ({addr}), {} sample(s)
+",
         args.server, args.samples
     );
-    println!("  #      offset        delay   stratum");
+    let Some(best) = run_samples(addr, &args, &mut Plain) else {
+        return ExitCode::FAILURE;
+    };
+    print_summary(&best);
+    println!("  Authentication    : none (plain NTP)");
+    ExitCode::SUCCESS
+}
 
+/// Takes `args.samples` samples and returns the one with the lowest delay
+fn run_samples(
+    addr: std::net::SocketAddr,
+    args: &Args,
+    protection: &mut impl Protection,
+) -> Option<Sample> {
+    println!("  #      offset        delay   stratum");
     let mut samples = Vec::new();
     for i in 1..=args.samples {
         if i > 1 {
             // Prevent spamming
             std::thread::sleep(Duration::from_secs(2));
         }
-        match query(addr, args.timeout) {
+        match query_with(addr, args.timeout, protection) {
             Ok(s) => {
                 println!(
                     "{i:>3} {:>14} {:>12.3} ms {:>5}",
@@ -107,12 +130,64 @@ fn main() -> ExitCode {
             Err(e) => println!("{i:>3}   failed: {e}"),
         }
     }
+    let best = samples.into_iter().min_by_key(|s| s.delay);
+    if best.is_none() {
+        eprintln!("
+error: no valid replies");
+    }
+    best
+}
 
-    let Some(best) = samples.iter().min_by_key(|s| s.delay) else {
-        eprintln!("\nerror: no valid replies");
+fn run_nts(args: &Args) -> ExitCode {
+    let (host, port) = match nts_ke::split_host_port(&args.server, nts_ke::DEFAULT_KE_PORT) {
+        Ok(hp) => hp,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    const KE_ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    let keys = loop {
+        match nts_ke::key_exchange(&host, port, args.timeout) {
+            Ok(k) => break k,
+            Err(e) if attempt < KE_ATTEMPTS => {
+                eprintln!("NTS-KE attempt {attempt} failed: {e}, retrying");
+                std::thread::sleep(Duration::from_secs(1));
+                attempt += 1;
+            }
+            Err(e) => {
+                eprintln!("error: NTS-KE with {host}:{port} failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let ntp = fmt_host_port(&keys.ntp_server, keys.ntp_port);
+    println!(
+        "NTS-KE with {}: {} cookies, NTP server {ntp}",
+        keys.peer,
+        keys.cookies.len()
+    );
+
+    let addr = match resolve(&ntp) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Querying {ntp} ({addr}) with NTS, {} sample(s)
+", args.samples);
+
+    let mut session = nts::NtsSession::new(keys);
+    let Some(best) = run_samples(addr, args, &mut session) else {
         return ExitCode::FAILURE;
     };
-    print_summary(best);
+    print_summary(&best);
+    println!(
+        "  Authentication    : NTS (AEAD_AES_SIV_CMAC_256), {} cookies left",
+        session.cookies_left()
+    );
     ExitCode::SUCCESS
 }
 
