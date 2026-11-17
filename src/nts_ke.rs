@@ -7,7 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_platform_verifier::BuilderVerifierExt;
 
 pub const DEFAULT_KE_PORT: u16 = 4460;
 pub const ALPN: &[u8] = b"ntske/1";
@@ -302,12 +303,13 @@ impl From<rustls::Error> for KeError {
     }
 }
 
+/// Certificates are checked against Windows' certificate store, which Windows
+/// Update keeps current, so new or retired root CAs don't need a new build
 fn tls_config() -> Result<Arc<ClientConfig>, KeError> {
-    let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_root_certificates(roots)
+            .with_platform_verifier()?
             .with_no_client_auth();
     config.alpn_protocols = vec![ALPN.to_vec()];
     Ok(Arc::new(config))
