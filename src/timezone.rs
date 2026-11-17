@@ -92,15 +92,6 @@ pub fn auto_update_on() -> bool {
         == Some(3)
 }
 
-/// Uses Windows Location Services to figure out user's timezone, can't derive when location disabled
-pub fn location_allowed() -> bool {
-    let key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location";
-    registry::read_string(Root::LocalMachine, key, "Value")
-        .ok()
-        .flatten()
-        .is_none_or(|v| v != "Deny")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

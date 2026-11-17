@@ -32,10 +32,13 @@ use nts_client::probe::{self, Probe};
 use nts_client::servers::{self, Protocol, Server};
 use nts_client::service;
 use nts_client::timezone::{self, Zone};
+use nts_client::tzdetect;
 use nts_client::update::{self, Release, Version};
 
 /// How often the service is asked for its status
 const POLL: Duration = Duration::from_secs(2);
+/// While Automatic is on, the time zone is checked against this PC's location this often
+const ZONE_RECHECK: Duration = Duration::from_secs(60 * 60);
 /// First update check after start-up, then this often
 const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(15);
 const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -78,6 +81,18 @@ struct Prefs {
     /// "Start with Windows" is switched on once, the first time the app runs
     #[serde(default)]
     autostart_set_up: bool,
+    /// "Automatic" time zone: set from this PC's location by the tray
+    #[serde(default)]
+    auto_time_zone: bool,
+}
+
+/// The last automatic time zone check
+#[derive(Clone, PartialEq)]
+enum Detect {
+    Idle,
+    Detecting,
+    Done,
+    Failed(String),
 }
 
 impl Prefs {
@@ -193,6 +208,11 @@ struct TrayApp {
     zone_search: String,
     /// An elevated change to automatic time zone, while it runs; then its result
     zone_change: Option<Slot<Result<(), String>>>,
+    /// Mirrors `prefs.auto_time_zone` for the location thread
+    zone_auto: Arc<AtomicBool>,
+    zone_detect: Arc<Mutex<Detect>>,
+    /// Asks the location thread to check now
+    detect_now: Sender<()>,
     autostart: bool,
     /// Why the last time zone or startup change failed
     settings_error: Option<String>,
@@ -278,6 +298,14 @@ impl TrayApp {
             prefs.save();
         }
 
+        let zone_auto = Arc::new(AtomicBool::new(prefs.auto_time_zone));
+        let zone_detect = Arc::new(Mutex::new(Detect::Idle));
+        let (detect_now, detect_rx) = mpsc::channel();
+        {
+            let (auto, state, ctx) = (zone_auto.clone(), zone_detect.clone(), ctx.clone());
+            thread::spawn(move || follow_location(detect_rx, auto, state, ctx));
+        }
+
         Ok(Self {
             shared,
             requests,
@@ -289,6 +317,9 @@ impl TrayApp {
             zones: timezone::list(),
             zone_search: String::new(),
             zone_change: None,
+            zone_auto,
+            zone_detect,
+            detect_now,
             autostart: autostart::is_enabled(),
             settings_error: None,
             update,
@@ -345,6 +376,57 @@ impl TrayApp {
             NtpChoice::Custom(host) => self.use_custom(host, Protocol::Ntp),
         }
     }
+}
+
+/// Background thread: while Automatic is on, sets the time zone from this PC's
+/// location at start-up, when it's switched on, and then hourly
+fn follow_location(
+    detect_now: Receiver<()>,
+    auto: Arc<AtomicBool>,
+    state: Arc<Mutex<Detect>>,
+    ctx: egui::Context,
+) {
+    let mut wait = Duration::ZERO;
+    loop {
+        match detect_now.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        wait = ZONE_RECHECK;
+        if !auto.load(Ordering::Relaxed) {
+            continue;
+        }
+        let set = |new: Detect| {
+            if let Ok(mut s) = state.lock() {
+                *s = new;
+            }
+            ctx.request_repaint();
+        };
+        set(Detect::Detecting);
+        let result = tzdetect::detect().and_then(|found| {
+            // Picked a zone by hand while this was running: leave theirs
+            if !auto.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            apply_zone(&found.windows_key)
+        });
+        set(match result {
+            Ok(()) if !auto.load(Ordering::Relaxed) => Detect::Idle,
+            Ok(()) => Detect::Done,
+            Err(e) => Detect::Failed(e),
+        });
+    }
+}
+
+fn apply_zone(key: &str) -> Result<(), String> {
+    if timezone::current().as_deref() == Some(key) {
+        return Ok(());
+    }
+    let zone = timezone::list()
+        .into_iter()
+        .find(|z| z.key == key)
+        .ok_or_else(|| format!("the {key} time zone isn't on this PC"))?;
+    timezone::set(&zone)
 }
 
 /// Background thread: checks GitHub soon after start-up, then daily, or when asked
@@ -638,7 +720,8 @@ impl TrayApp {
             self.settings_error = result.err();
         }
 
-        let automatic = timezone::auto_update_on();
+        // Ours, or Windows' own "Set time zone automatically"
+        let automatic = self.prefs.auto_time_zone || timezone::auto_update_on();
         let current = timezone::current();
         let selected = self
             .zones
@@ -656,88 +739,118 @@ impl TrayApp {
 
         let mut pick = None;
         let busy = self.zone_change.is_some();
-        ui.add_enabled_ui(!busy, |ui| {
-            egui::ComboBox::from_id_salt("timezone")
-                .width(ui.available_width())
-                .height(360.0)
-                .selected_text(RichText::new(text).size(15.0))
-                .show_ui(ui, |ui| {
-                    let search = ui.add(
-                        egui::TextEdit::singleline(&mut self.zone_search)
-                            .hint_text("Search, e.g. Singapore or UTC+08")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if ui.memory(|m| m.focused().is_none()) {
-                        search.request_focus();
-                    }
-                    let query = self.zone_search.to_lowercase();
-                    if ("automatic".contains(&query) || query.is_empty())
-                        && ui.selectable_label(automatic, "Automatic").clicked()
-                        && !automatic
-                    {
-                        pick = Some(ZonePick::Automatic);
-                    }
-                    for (i, zone) in self.zones.iter().enumerate() {
-                        let matches = query.is_empty()
-                            || zone.display.to_lowercase().contains(&query)
-                            || zone.key.to_lowercase().contains(&query);
-                        let is_selected = !automatic && selected == Some(i);
-                        if matches
-                            && ui.selectable_label(is_selected, &zone.display).clicked()
-                            && !is_selected
-                        {
-                            pick = Some(ZonePick::Zone(i));
+        let detect = self
+            .zone_detect
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or(Detect::Idle);
+        let visuals = ui.visuals();
+        let subtle = visuals.weak_text_color().lerp_to_gamma(visuals.text_color(), 0.4);
+        // The dropdown and the lines under it sit close together
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("timezone")
+                    .width(ui.available_width())
+                    .height(360.0)
+                    .selected_text(RichText::new(text).size(15.0))
+                    .show_ui(ui, |ui| {
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut self.zone_search)
+                                .hint_text("Search, e.g. Singapore or UTC+08")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui.memory(|m| m.focused().is_none()) {
+                            search.request_focus();
                         }
-                    }
-                });
-        });
-
-        if busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Approve the Windows prompt to continue...").weak());
+                        let query = self.zone_search.to_lowercase();
+                        if ("automatic".contains(&query) || query.is_empty())
+                            && ui.selectable_label(automatic, "Automatic").clicked()
+                            && !automatic
+                        {
+                            pick = Some(ZonePick::Automatic);
+                        }
+                        for (i, zone) in self.zones.iter().enumerate() {
+                            let matches = query.is_empty()
+                                || zone.display.to_lowercase().contains(&query)
+                                || zone.key.to_lowercase().contains(&query);
+                            let is_selected = !automatic && selected == Some(i);
+                            if matches
+                                && ui.selectable_label(is_selected, &zone.display).clicked()
+                                && !is_selected
+                            {
+                                pick = Some(ZonePick::Zone(i));
+                            }
+                        }
+                    });
             });
-        } else {
-            ui.label(RichText::new(format!("Selected: {current_name}")).small().weak());
-            if automatic && !timezone::location_allowed() {
-                ui.label(
-                    RichText::new(
-                        "Location access is off in Windows Settings, so Automatic can't \
-                         detect your time zone.",
-                    )
-                    .small()
-                    .color(WARN),
-                );
+
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Approve the Windows prompt to continue...").small().color(subtle));
+                });
+            } else {
+                if self.prefs.auto_time_zone {
+                    match &detect {
+                        Detect::Detecting => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Finding your location...").small().color(subtle));
+                            });
+                        }
+                        Detect::Failed(e) => {
+                            ui.label(
+                                RichText::new(format!("Couldn't set the time zone automatically: {e}"))
+                                    .small()
+                                    .color(BAD),
+                            );
+                        }
+                        Detect::Idle | Detect::Done => {}
+                    }
+                }
+                ui.label(RichText::new(format!("Selected: {current_name}")).small().color(subtle));
             }
-        }
+        });
 
         match pick {
             Some(ZonePick::Automatic) => {
                 self.zone_search.clear();
-                self.change_zone_elevated(ui.ctx(), None);
-            }
-            // Automatic would change it back so it's switched off first
-            Some(ZonePick::Zone(i)) if automatic => {
-                self.zone_search.clear();
-                self.change_zone_elevated(ui.ctx(), Some(self.zones[i].clone()));
+                self.settings_error = None;
+                self.prefs.auto_time_zone = true;
+                self.prefs.save();
+                self.zone_auto.store(true, Ordering::Relaxed);
+                let _ = self.detect_now.send(());
             }
             Some(ZonePick::Zone(i)) => {
                 self.zone_search.clear();
-                self.settings_error = timezone::set(&self.zones[i]).err();
+                if self.prefs.auto_time_zone {
+                    self.prefs.auto_time_zone = false;
+                    self.prefs.save();
+                    self.zone_auto.store(false, Ordering::Relaxed);
+                    if let Ok(mut d) = self.zone_detect.lock() {
+                        *d = Detect::Idle;
+                    }
+                }
+                let zone = self.zones[i].clone();
+                if timezone::auto_update_on() {
+                    // Windows' own automatic time zone would change it back
+                    self.change_zone_elevated(ui.ctx(), zone);
+                } else {
+                    self.settings_error = timezone::set(&zone).err();
+                }
             }
             None => {}
         }
     }
 
-    /// Turns automatic time zone on (`None`), or off and then sets `zone`. Changing it needs administrator permission.
-    fn change_zone_elevated(&mut self, ctx: &egui::Context, zone: Option<Zone>) {
+    /// Switches off Windows' own automatic time zone, then sets `zone`.
+    /// Changing that setting needs administrator permission.
+    fn change_zone_elevated(&mut self, ctx: &egui::Context, zone: Zone) {
         let slot = Arc::new(Mutex::new(None));
         let (out, ctx) = (slot.clone(), ctx.clone());
         thread::spawn(move || {
-            let result = match &zone {
-                None => run_elevated("--auto-timezone on"),
-                Some(zone) => run_elevated("--auto-timezone off").and_then(|()| timezone::set(zone)),
-            };
+            let result = run_elevated("--auto-timezone off").and_then(|()| timezone::set(&zone));
             if let Ok(mut r) = out.lock() {
                 *r = Some(result);
             }
