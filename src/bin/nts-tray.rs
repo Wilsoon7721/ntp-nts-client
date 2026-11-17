@@ -23,7 +23,9 @@ use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObj
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SW_HIDE};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXSMICON, SW_HIDE, SW_SHOWNORMAL,
+};
 
 use nts_client::autostart;
 use nts_client::config::CUSTOM_ID;
@@ -1068,7 +1070,10 @@ fn update_banner(ui: &mut egui::Ui, release: &Release, state: &UpdateState) -> O
                         .small()
                         .weak(),
                 );
-                ui.hyperlink_to(RichText::new("What's new").small(), &release.page_url);
+                let link = ui.link(RichText::new("What's new").small());
+                if link.on_hover_text(&release.changelog_url).clicked() {
+                    open_in_browser(&release.changelog_url);
+                }
             });
         }
     }
@@ -1426,6 +1431,24 @@ fn service_down(
         }
     }
     pressed
+}
+
+/// Opens an https:// link in the default browser. eframe can do this itself,
+/// but only with its `links` feature, which pulls in another crate.
+fn open_in_browser(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (verb, file) = (wide("open"), wide(url));
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&mut info);
+    }
 }
 
 /// Runs nts-client.exe from next to this exe, elevated, and waits for it

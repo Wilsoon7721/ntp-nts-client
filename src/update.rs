@@ -55,8 +55,8 @@ impl fmt::Display for Version {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub version: Version,
-    /// The release page, for "What's new"
-    pub page_url: String,
+    /// This version's section of CHANGELOG.md, for "What's new"
+    pub changelog_url: String,
     installer_name: String,
     installer_url: String,
     /// Lowercase hex, from GitHub
@@ -67,7 +67,6 @@ pub struct Release {
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
-    html_url: String,
     #[serde(default)]
     assets: Vec<GhAsset>,
 }
@@ -87,6 +86,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// GitHub names a "## 1.2.3" heading's anchor "#123"
+pub fn changelog_url(version: Version) -> String {
+    format!(
+        "https://github.com/{REPO}/blob/v{version}/CHANGELOG.md#{}{}{}",
+        version.0, version.1, version.2
+    )
 }
 
 pub fn installer_name(version: Version) -> String {
@@ -143,7 +150,7 @@ fn newer_release(release: GhRelease, current: Version) -> Result<Option<Release>
         .to_ascii_lowercase();
     Ok(Some(Release {
         version,
-        page_url: release.html_url,
+        changelog_url: changelog_url(version),
         installer_url: asset.browser_download_url.clone(),
         sha256,
         installer_name: name,
@@ -235,7 +242,6 @@ mod tests {
     fn release(tag: &str, assets: &[(&str, Option<String>)]) -> GhRelease {
         GhRelease {
             tag_name: tag.into(),
-            html_url: "https://example.invalid/release".into(),
             assets: assets
                 .iter()
                 .map(|(n, digest)| GhAsset {
@@ -256,6 +262,7 @@ mod tests {
         assert_eq!(r.version, Version(1, 1, 0));
         assert!(r.installer_url.ends_with(setup));
         assert_eq!(r.sha256, DIGEST);
+        assert!(r.changelog_url.ends_with("/blob/v1.1.0/CHANGELOG.md#110"), "{}", r.changelog_url);
 
         assert_eq!(newer_release(release("v1.0.0", &[]), current).unwrap(), None);
         assert!(newer_release(release("v1.1.0", &[]), current).is_err());
