@@ -14,3 +14,4 @@ pub mod service;
 pub mod sync;
 pub mod time;
 pub mod timezone;
+pub mod update;

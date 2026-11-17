@@ -32,9 +32,13 @@ use nts_client::probe::{self, Probe};
 use nts_client::servers::{self, Protocol, Server};
 use nts_client::service;
 use nts_client::timezone::{self, Zone};
+use nts_client::update::{self, Release, Version};
 
 /// How often the service is asked for its status
 const POLL: Duration = Duration::from_secs(2);
+/// First update check after start-up, then this often
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(15);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Per-attempt timeout when checking a custom server
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -161,6 +165,23 @@ enum Dialog {
     },
 }
 
+#[derive(Clone)]
+enum UpdateState {
+    /// A local build, which doesn't update itself
+    Off,
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    /// Downloading or waiting on the admin prompt; the text says which
+    Installing(Release, &'static str),
+    Failed {
+        /// Still offered, so it can be retried
+        release: Option<Release>,
+        error: String,
+    },
+}
+
 struct TrayApp {
     shared: Arc<Mutex<Shared>>,
     requests: Sender<Request>,
@@ -174,6 +195,10 @@ struct TrayApp {
     autostart: bool,
     /// Why the last time zone or startup change failed
     settings_error: Option<String>,
+    update: Arc<Mutex<UpdateState>>,
+    /// Asks the update thread to check now
+    check_now: Sender<()>,
+    tooltip_says_update: bool,
     /// Removed from the tray when dropped
     _tray: TrayIcon,
 }
@@ -234,6 +259,17 @@ impl TrayApp {
             thread::spawn(move || talk_to_service(request_rx, shared, ctx));
         }
 
+        let update = Arc::new(Mutex::new(if update::enabled() {
+            UpdateState::Idle
+        } else {
+            UpdateState::Off
+        }));
+        let (check_now, check_rx) = mpsc::channel();
+        if update::enabled() {
+            let (update, ctx) = (update.clone(), ctx.clone());
+            thread::spawn(move || check_for_updates(check_rx, update, ctx));
+        }
+
         let mut prefs = Prefs::load();
         if !prefs.autostart_set_up {
             if let Ok(exe) = std::env::current_exe() {
@@ -255,6 +291,9 @@ impl TrayApp {
             zone_search: String::new(),
             autostart: autostart::is_enabled(),
             settings_error: None,
+            update,
+            check_now,
+            tooltip_says_update: false,
             _tray: tray,
         })
     }
@@ -305,6 +344,37 @@ impl TrayApp {
             NtpChoice::Listed(server) => self.use_listed(server, true),
             NtpChoice::Custom(host) => self.use_custom(host, Protocol::Ntp),
         }
+    }
+}
+
+/// Background thread: checks GitHub soon after start-up, then daily, or when asked
+fn check_for_updates(check_now: Receiver<()>, state: Arc<Mutex<UpdateState>>, ctx: egui::Context) {
+    let mut wait = UPDATE_FIRST_CHECK;
+    loop {
+        match check_now.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        wait = UPDATE_INTERVAL;
+        let set = |new: UpdateState| {
+            if let Ok(mut s) = state.lock() {
+                *s = new;
+            }
+            ctx.request_repaint();
+        };
+        // Don't disturb an install in progress
+        if matches!(state.lock().as_deref(), Ok(UpdateState::Installing(..))) {
+            continue;
+        }
+        set(UpdateState::Checking);
+        set(match update::check() {
+            Ok(Some(release)) => UpdateState::Available(release),
+            Ok(None) => UpdateState::UpToDate,
+            Err(error) => UpdateState::Failed {
+                release: None,
+                error,
+            },
+        });
     }
 }
 
@@ -359,6 +429,19 @@ impl eframe::App for TrayApp {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
+        let update_ready = matches!(
+            self.update.lock().as_deref(),
+            Ok(UpdateState::Available(_) | UpdateState::Failed { release: Some(_), .. })
+        );
+        if update_ready != self.tooltip_says_update {
+            let tooltip = if update_ready {
+                "NTS Client · update available"
+            } else {
+                "NTS Client"
+            };
+            let _ = self._tray.set_tooltip(Some(tooltip));
+            self.tooltip_says_update = update_ready;
+        }
         if self.show.swap(false, Ordering::Relaxed) {
             // May have been changed from Task Manager while hidden
             self.autostart = autostart::is_enabled();
@@ -400,15 +483,24 @@ impl eframe::App for TrayApp {
                 }
             };
         let connected = unreachable.is_none() && reply.is_some();
+        let update_state = self
+            .update
+            .lock()
+            .map(|u| u.clone())
+            .unwrap_or(UpdateState::Off);
 
         let mut picked = None;
         let mut action = None;
+        let mut update_action = None;
         let panel = egui::Frame::new()
             .fill(ui.visuals().panel_fill)
             .inner_margin(Margin::same(16));
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
+                if let Some(release) = offered_release(&update_state) {
+                    card(ui, |ui| update_action = update_banner(ui, release, &update_state));
+                }
                 card(ui, clock);
                 card(ui, |ui| {
                     action = status(
@@ -433,8 +525,19 @@ impl eframe::App for TrayApp {
                         ui.colored_label(BAD, e);
                     }
                 });
+                if let Some(a) = version_line(ui, &update_state) {
+                    update_action = Some(a);
+                }
             });
         });
+
+        match update_action {
+            Some(UpdateAction::CheckNow) => {
+                let _ = self.check_now.send(());
+            }
+            Some(UpdateAction::Install(release)) => self.install_update(ui.ctx(), release),
+            None => {}
+        }
 
         if let Some(action) = action {
             self.run_helper(ui.ctx(), action);
@@ -469,6 +572,37 @@ impl eframe::App for TrayApp {
 }
 
 impl TrayApp {
+    /// Downloads and verifies the installer, starts it, then quits so it can replace this exe
+    fn install_update(&self, ctx: &egui::Context, release: Release) {
+        let (state, quit, ctx) = (self.update.clone(), self.quit.clone(), ctx.clone());
+        thread::spawn(move || {
+            let set = |new: UpdateState| {
+                if let Ok(mut s) = state.lock() {
+                    *s = new;
+                }
+                ctx.request_repaint();
+            };
+            set(UpdateState::Installing(release.clone(), "Downloading..."));
+            let result = update::download(&release).and_then(|path| {
+                set(UpdateState::Installing(
+                    release.clone(),
+                    "Approve the Windows prompt to continue...",
+                ));
+                update::run_installer(&path)
+            });
+            match result {
+                Ok(()) => {
+                    quit.store(true, Ordering::Relaxed);
+                    ctx.request_repaint();
+                }
+                Err(error) => set(UpdateState::Failed {
+                    release: Some(release),
+                    error,
+                }),
+            }
+        });
+    }
+
     fn run_helper(&self, ctx: &egui::Context, action: ServiceAction) {
         let args = match action {
             ServiceAction::Start | ServiceAction::DisableW32Time => "--start",
@@ -703,6 +837,90 @@ impl TrayApp {
             failed,
         };
     }
+}
+
+enum UpdateAction {
+    CheckNow,
+    Install(Release),
+}
+
+/// The release the banner offers, if any
+fn offered_release(state: &UpdateState) -> Option<&Release> {
+    match state {
+        UpdateState::Available(r)
+        | UpdateState::Installing(r, _)
+        | UpdateState::Failed {
+            release: Some(r), ..
+        } => Some(r),
+        _ => None,
+    }
+}
+
+fn update_banner(ui: &mut egui::Ui, release: &Release, state: &UpdateState) -> Option<UpdateAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(icon(Icon::CircleArrowUp).size(18.0).color(ACCENT));
+        ui.label(
+            RichText::new(format!("Version {} is available", release.version))
+                .size(15.0)
+                .strong(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let UpdateState::Installing(..) = state {
+                ui.spinner();
+            } else if ui.add(accent_button("Install")).clicked() {
+                action = Some(UpdateAction::Install(release.clone()));
+            }
+        });
+    });
+    match state {
+        UpdateState::Installing(_, step) => {
+            ui.label(RichText::new(*step).weak());
+        }
+        UpdateState::Failed { error, .. } => {
+            ui.colored_label(BAD, error);
+        }
+        _ => {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Needs administrator permission. The service restarts after.")
+                        .small()
+                        .weak(),
+                );
+                ui.hyperlink_to(RichText::new("What's new").small(), &release.page_url);
+            });
+        }
+    }
+    action
+}
+
+/// "NTS Client 1.0.0 (abc1234) · Up to date · Check now" under the cards
+fn version_line(ui: &mut egui::Ui, state: &UpdateState) -> Option<UpdateAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("NTS Client {} ({})", Version::current(), update::COMMIT))
+                .small()
+                .weak(),
+        );
+        let (text, can_check) = match state {
+            UpdateState::Off => ("Local build, doesn't update itself".to_string(), false),
+            UpdateState::Idle => (String::new(), true),
+            UpdateState::Checking => ("Checking for updates...".into(), false),
+            UpdateState::UpToDate => ("Up to date".into(), true),
+            UpdateState::Available(_) | UpdateState::Installing(..) => (String::new(), false),
+            UpdateState::Failed { release: Some(_), .. } => (String::new(), false),
+            UpdateState::Failed { error, .. } => (format!("Update check failed: {error}"), true),
+        };
+        if !text.is_empty() {
+            ui.label(RichText::new("·").small().weak());
+            ui.label(RichText::new(text).small().weak());
+        }
+        if can_check && ui.link(RichText::new("Check now").small()).clicked() {
+            action = Some(UpdateAction::CheckNow);
+        }
+    });
+    action
 }
 
 /// Asks before using plain NTP. `Some(true)` = accepted, `Some(false)` = cancelled.
