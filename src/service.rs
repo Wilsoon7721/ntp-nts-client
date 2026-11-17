@@ -1,29 +1,26 @@
-//! Running the `--sync` loop as a Windows service
-//!
-//! `--install` registers this exe with the Service Control Manager (SCM) to be launched as `nts-client.exe --service <your options>`
-//! Log goes to `%ProgramData%\nts-client\sync.log`
-
 use std::error::Error as _;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
-use std::sync::OnceLock;
-use std::thread::sleep;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    Service, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
+use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 
-use crate::sync::{self, Stop};
-use crate::Args;
+use crate::config::{self, Config, CustomServer};
+use crate::ipc::{self, Client, Reply, Request};
+use crate::servers::{self, Protocol};
+use crate::sync::{self, Command, Control, Status, SyncConfig};
 
 pub const SERVICE_NAME: &str = "nts-client";
 const DISPLAY_NAME: &str = "NTS Client";
@@ -31,12 +28,11 @@ const DESCRIPTION: &str = "Keeps the system clock in sync using NTS-authenticate
 const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
 /// Log is moved to `sync.log.old` past this size
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
-static ARGS: OnceLock<Args> = OnceLock::new();
 
 define_windows_service!(ffi_service_main, service_main);
 
 /// Registers the service
-pub fn install(options: Vec<OsString>) -> Result<(), String> {
+pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Files under a user profile are only readable by that user, SYSTEM and
     // Administrators, so LOCAL SERVICE couldn't even launch the exe
@@ -63,8 +59,6 @@ pub fn install(options: Vec<OsString>) -> Result<(), String> {
         )
     })?;
 
-    let mut launch_arguments = vec![OsString::from("--service")];
-    launch_arguments.extend(options);
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: DISPLAY_NAME.into(),
@@ -72,7 +66,7 @@ pub fn install(options: Vec<OsString>) -> Result<(), String> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe,
-        launch_arguments,
+        launch_arguments: vec![OsString::from("--service")],
         dependencies: vec![],
         account_name: Some(ACCOUNT.into()),
         account_password: None,
@@ -95,29 +89,88 @@ pub fn uninstall() -> Result<(), String> {
         )
         .map_err(|e| format!("could not open the service (run elevated): {}", describe(e)))?;
 
-    let state = || {
-        service
-            .query_status()
-            .map(|s| s.current_state)
-            .map_err(describe)
-    };
-    if state()? != ServiceState::Stopped {
+    if state_of(&service)? != ServiceState::Stopped {
         service.stop().map_err(describe)?;
         // A burst in progress can take ~20 s to notice the stop
-        let deadline = Instant::now() + Duration::from_secs(40);
-        while state()? != ServiceState::Stopped {
-            if Instant::now() > deadline {
-                return Err("service didn't stop within 40 s".into());
-            }
-            sleep(Duration::from_millis(500));
-        }
+        wait_for(&service, ServiceState::Stopped, Duration::from_secs(40))?;
     }
     service.delete().map_err(describe)
 }
 
+/// Stops Windows Time if it's running, then starts the service
+pub fn start() -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("could not open the service manager: {}", describe(e)))?;
+
+    if let Ok(w32time) = manager.open_service(
+        "W32Time",
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+    ) && state_of(&w32time)? != ServiceState::Stopped
+    {
+        w32time
+            .stop()
+            .map_err(|e| format!("could not stop Windows Time (run elevated): {}", describe(e)))?;
+        wait_for(&w32time, ServiceState::Stopped, Duration::from_secs(30))?;
+    }
+
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::START)
+        .map_err(|e| format!("could not open the service (run elevated): {}", describe(e)))?;
+    if state_of(&service)? != ServiceState::Running {
+        service
+            .start::<&str>(&[])
+            .map_err(|e| format!("could not start the service: {}", describe(e)))?;
+        wait_for(&service, ServiceState::Running, Duration::from_secs(30))?;
+    }
+    Ok(())
+}
+
+pub fn query() -> Result<Option<ServiceState>, String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(describe)?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => state_of(&service).map(Some),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(describe(e)),
+    }
+}
+
+fn state_of(service: &Service) -> Result<ServiceState, String> {
+    service
+        .query_status()
+        .map(|s| s.current_state)
+        .map_err(describe)
+}
+
+fn wait_for(service: &Service, target: ServiceState, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = state_of(service)?;
+        if state == target {
+            return Ok(());
+        }
+        if target == ServiceState::Running && state == ServiceState::Stopped {
+            return Err(format!(
+                "the service stopped right after starting; see {}",
+                config::data_dir().join("sync.log").display()
+            ));
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "still {state:?} after {} s, expected {target:?}",
+                timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_millis(300));
+    }
+}
+
 /// Entry point when the SCM launches us (`--service`) - blocks until the service stops
-pub fn dispatch(args: Args) -> ExitCode {
-    let _ = ARGS.set(args);
+pub fn dispatch() -> ExitCode {
     match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -140,22 +193,27 @@ fn describe(e: windows_service::Error) -> String {
 
 /// Runs on a thread the SCM creates
 fn service_main(_start_arguments: Vec<OsString>) {
-    let mut log = FileLog::open();
-    let Some(args) = ARGS.get() else { return };
+    let log = Arc::new(Mutex::new(FileLog::open()));
+    let write_log = |line: &str| {
+        if let Ok(mut l) = log.lock() {
+            l.write(line);
+        }
+    };
 
-    let (stop_tx, stop_rx) = mpsc::channel();
+    let (commands, command_rx) = mpsc::channel();
+    let stop = commands.clone();
     let handler = move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
-            let _ = stop_tx.send(());
+            let _ = stop.send(Command::Stop);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     };
-    let status = match service_control_handler::register(SERVICE_NAME, handler) {
+    let status_handle = match service_control_handler::register(SERVICE_NAME, handler) {
         Ok(s) => s,
         Err(e) => {
-            log.write(&format!(
+            write_log(&format!(
                 "could not register with the service manager: {}",
                 describe(e)
             ));
@@ -163,7 +221,7 @@ fn service_main(_start_arguments: Vec<OsString>) {
         }
     };
     let report = |state, accept, exit_code| {
-        let _ = status.set_service_status(ServiceStatus {
+        let _ = status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accept,
@@ -174,16 +232,48 @@ fn service_main(_start_arguments: Vec<OsString>) {
         });
     };
 
+    let config = Arc::new(Mutex::new(Config::load()));
+    let status = Arc::new(Mutex::new(Status::default()));
+    let source = config
+        .lock()
+        .map(|c| c.source())
+        .unwrap_or_else(|_| Config::default().source());
+
+    {
+        let (config, status, log) = (config.clone(), status.clone(), log.clone());
+        let commands = Mutex::new(commands);
+        thread::spawn(move || {
+            let handler =
+                move |req, client| handle_request(req, client, &config, &status, &commands);
+            if let Err(e) = ipc::serve(ipc::PIPE_NAME, handler)
+                && let Ok(mut l) = log.lock()
+            {
+                l.write(&format!("pipe for the tray app failed: {e}"));
+            }
+        });
+    }
+
     report(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         ServiceExitCode::Win32(0),
     );
-    let result = sync::run(args, &Stop::on(stop_rx), &mut |line| log.write(line));
+    let sync_config = SyncConfig {
+        source,
+        samples: 4,
+        timeout: Duration::from_secs(5),
+        poll: Duration::from_secs(64),
+    };
+    let result = sync::run(
+        sync_config,
+        &Control::on(command_rx),
+        &status,
+        &mut |line| write_log(line),
+    );
     let exit_code = match result {
         Ok(()) => ServiceExitCode::Win32(0),
         Err(e) => {
-            log.write(&format!("error: {e}"));
+            write_log(&format!("error: {e}"));
             ServiceExitCode::ServiceSpecific(1)
         }
     };
@@ -194,6 +284,113 @@ fn service_main(_start_arguments: Vec<OsString>) {
     );
 }
 
+/// Answers the tray app
+fn handle_request(
+    request: Request,
+    client: Client,
+    config: &Mutex<Config>,
+    status: &Mutex<Status>,
+    commands: &Mutex<mpsc::Sender<Command>>,
+) -> Reply {
+    let error = match request {
+        Request::Status => None,
+        Request::SetServer {
+            id,
+            accept_unauthenticated,
+        } => set_server(&id, accept_unauthenticated, config, commands).err(),
+        Request::SetCustom {
+            host,
+            protocol,
+            accept_unauthenticated,
+        } => set_custom(
+            host,
+            protocol,
+            accept_unauthenticated,
+            client,
+            config,
+            commands,
+        )
+        .err(),
+    };
+    let (server_id, custom) = config
+        .lock()
+        .map(|c| (c.server.clone(), c.custom.clone()))
+        .unwrap_or_default();
+    Reply {
+        error,
+        server_id,
+        custom,
+        status: status.lock().map(|s| s.clone()).unwrap_or_default(),
+    }
+}
+
+fn set_server(
+    id: &str,
+    accept_unauthenticated: bool,
+    config: &Mutex<Config>,
+    commands: &Mutex<mpsc::Sender<Command>>,
+) -> Result<(), String> {
+    let server = servers::find(id).ok_or_else(|| format!("unknown server {id:?}"))?;
+    if server.protocol == Protocol::Ntp && !accept_unauthenticated {
+        return Err(format!(
+            "{} is unauthenticated NTP; the risk must be accepted first",
+            server.host
+        ));
+    }
+    switch(config, commands, |c| Config {
+        server: server.id.into(),
+        // Remembered so it can be picked again
+        custom: c.custom.clone(),
+    })
+}
+
+fn set_custom(
+    host: String,
+    protocol: Protocol,
+    accept_unauthenticated: bool,
+    client: Client,
+    config: &Mutex<Config>,
+    commands: &Mutex<mpsc::Sender<Command>>,
+) -> Result<(), String> {
+    if !client.is_admin {
+        return Err("custom servers can only be set from an administrator account".into());
+    }
+    let host = host.trim().to_string();
+    if !config::valid_host(&host) {
+        return Err(format!("{host:?} isn't a valid hostname or IP address"));
+    }
+    if protocol == Protocol::Ntp && !accept_unauthenticated {
+        return Err(format!(
+            "{host} is unauthenticated NTP; the risk must be accepted first"
+        ));
+    }
+    switch(config, commands, |_| Config {
+        server: config::CUSTOM_ID.into(),
+        custom: Some(CustomServer { host, protocol }),
+    })
+}
+
+/// Saves the new config and points the sync loop at it, unless nothing changed
+fn switch(
+    config: &Mutex<Config>,
+    commands: &Mutex<mpsc::Sender<Command>>,
+    make: impl FnOnce(&Config) -> Config,
+) -> Result<(), String> {
+    let mut config = config.lock().map_err(|_| "config lock poisoned")?;
+    let new = make(&config);
+    if new.source() == config.source() {
+        return Ok(());
+    }
+    new.save()?;
+    let source = new.source();
+    *config = new;
+    commands
+        .lock()
+        .map_err(|_| "command lock poisoned")?
+        .send(Command::SetSource(source))
+        .map_err(|_| "the sync loop has stopped".to_string())
+}
+
 /// Appends lines to `%ProgramData%\nts-client\sync.log`, keeping one old file
 struct FileLog {
     path: PathBuf,
@@ -202,10 +399,7 @@ struct FileLog {
 
 impl FileLog {
     fn open() -> Self {
-        let dir = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("nts-client");
+        let dir = config::data_dir();
         let path = dir.join("sync.log");
         let _ = fs::create_dir_all(&dir);
         let mut log = Self { path, file: None };

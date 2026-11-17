@@ -1,9 +1,3 @@
-//! Changing the Windows system clock.
-//!
-//! Setting the time needs `SeSystemtimePrivilege`. Administrators hold it, but
-//! only in an elevated ("Run as administrator") process, and even then it is
-//! disabled until the process switches it on with `AdjustTokenPrivileges`.
-
 use std::fmt;
 use std::io;
 use std::mem;

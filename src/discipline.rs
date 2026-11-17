@@ -1,10 +1,3 @@
-//! Turns offset measurements into clock corrections
-//!
-//! Frequency is measured, not integrated: the offset change over the last
-//! [`WINDOW`] points, plus the corrections we applied meanwhile, is the clock's
-//! own drift. Phase is then slewed with `rate = freq + offset/τ`. Unlike a PI
-//! loop, a large starting offset can't wind up the frequency and overshoot.
-
 use std::collections::VecDeque;
 
 pub const STEP_THRESHOLD: f64 = 0.128;

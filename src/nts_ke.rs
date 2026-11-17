@@ -443,6 +443,29 @@ fn interleave_families(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     out
 }
 
+/// [`key_exchange`], retrying a few times since a lost packet can stall the TLS handshake.
+/// `on_retry` is told about each failed attempt that will be retried.
+pub fn key_exchange_with_retries(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    mut on_retry: impl FnMut(u32, &KeError),
+) -> Result<NtsKeys, KeError> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match key_exchange(host, port, timeout) {
+            Ok(k) => return Ok(k),
+            Err(e) if attempt < ATTEMPTS => {
+                on_retry(attempt, &e);
+                thread::sleep(Duration::from_secs(1));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Splits `host`, `host:port`, `[v6]:port` or a bare IPv6 address
 pub fn split_host_port(s: &str, default_port: u16) -> Result<(String, u16), String> {
     let bad_port = || format!("invalid port in {s:?}");

@@ -1,22 +1,15 @@
-mod client;
-mod clock;
-mod discipline;
-mod nts;
-mod nts_ke;
-mod packet;
-mod service;
-mod sync;
-mod time;
-
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use client::{query_with, resolve, Plain, Protection, Sample};
-use packet::LeapIndicator;
+use nts_client::client::{fmt_host_port, query_with, resolve, Plain, Protection, Sample};
+use nts_client::packet::LeapIndicator;
+use nts_client::servers::Protocol;
+use nts_client::{clock, nts, nts_ke, service, sync, time};
 
 const USAGE: &str = "\
 Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts-ke | --sync [-p POLL_SECS]]
-       nts-client --install [SERVER] [-p POLL_SECS] | --uninstall
+       nts-client [--install] [--start] | --uninstall
 
   SERVER   host, host:port, ip or [ipv6]:port (default: time.cloudflare.com)
   -n       number of samples, 2 s apart       (default: 4)
@@ -32,10 +25,12 @@ Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts
            (needs an elevated terminal and the Windows Time service stopped)
   -p       with --sync: seconds between polls (default: 64, min: 16)
   --install    register --sync as a Windows service (\"NTS Client\") that
-               starts at boot, with the given SERVER and -p. Start it with
-               `net start nts-client`; it logs to %ProgramData%\\nts-client\\sync.log
+               starts at boot. Pick its server with nts-tray.
+               Logs to %ProgramData%\\nts-client\\sync.log
+  --start      stop Windows Time if it's running, then start the service
+               (nts-tray runs this for you, after a Windows admin prompt)
   --uninstall  stop and remove the service
-  (both need an elevated terminal)
+  (all three need an elevated terminal)
 
 Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. The system clock is only changed with --set or --sync.";
 
@@ -49,6 +44,8 @@ struct Args {
     sync: bool,
     poll: Duration,
     install: bool,
+    start: bool,
+    error_file: Option<String>,
     uninstall: bool,
     service: bool,
 }
@@ -64,6 +61,8 @@ fn parse_args() -> Result<Args, String> {
         sync: false,
         poll: Duration::from_secs(64),
         install: false,
+        start: false,
+        error_file: None,
         uninstall: false,
         service: false,
     };
@@ -76,6 +75,8 @@ fn parse_args() -> Result<Args, String> {
             "--set" => args.set = true,
             "--sync" => args.sync = true,
             "--install" => args.install = true,
+            "--start" => args.start = true,
+            "--error-file" => args.error_file = Some(it.next().ok_or("--error-file needs a path")?),
             "--uninstall" => args.uninstall = true,
             "--service" => args.service = true,
             "-n" => {
@@ -122,27 +123,33 @@ fn main() -> ExitCode {
         }
     };
 
+    // When nts-tray runs us elevated it can't see our console, so errors also go to a file
+    let fail = |e: String| {
+        eprintln!("error: {e}");
+        if let Some(path) = &args.error_file {
+            let _ = std::fs::write(path, &e);
+        }
+        ExitCode::FAILURE
+    };
     if args.install {
-        // Everything else on the command line is handed to the service at each start
-        let options = std::env::args_os()
-            .skip(1)
-            .filter(|a| a != "--install" && a != "--sync")
-            .collect();
-        return match service::install(options) {
+        if let Err(e) = service::install() {
+            return fail(e);
+        }
+        if !args.start {
+            println!(
+                "Installed the {:?} service. Start it with: nts-client --start",
+                service::SERVICE_NAME
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
+    if args.start {
+        return match service::start() {
             Ok(()) => {
-                println!(
-                    "Installed the {:?} service. Stop Windows Time, then start it:
-                       net stop w32time
-  net start {}",
-                    service::SERVICE_NAME,
-                    service::SERVICE_NAME
-                );
+                println!("The {:?} service is running", service::SERVICE_NAME);
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => fail(e),
         };
     }
     if args.uninstall {
@@ -158,7 +165,7 @@ fn main() -> ExitCode {
         };
     }
     if args.service {
-        return service::dispatch(args);
+        return service::dispatch();
     }
     if args.sync {
         return run_sync(&args);
@@ -239,7 +246,9 @@ fn run_nts(args: &Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let keys = match ke_with_retries(&host, port, args.timeout) {
+    let keys = match nts_ke::key_exchange_with_retries(&host, port, args.timeout, |n, e| {
+        eprintln!("NTS-KE attempt {n} failed: {e}, retrying");
+    }) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("error: NTS-KE with {host}:{port} failed: {e}");
@@ -284,32 +293,23 @@ fn run_sync(args: &Args) -> ExitCode {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
-    match sync::run(args, &sync::Stop::never(), &mut |line| println!("{line}")) {
+    let config = sync::SyncConfig {
+        source: sync::Source {
+            host: args.server.clone(),
+            protocol: Protocol::Nts,
+        },
+        samples: args.samples,
+        timeout: args.timeout,
+        poll: args.poll,
+    };
+    let status = Mutex::new(sync::Status::default());
+    match sync::run(config, &sync::Control::never(), &status, &mut |line| {
+        println!("{line}")
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
-        }
-    }
-}
-
-/// NTS-KE, retrying a few times since a lost packet can stall the TLS handshake
-fn ke_with_retries(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<nts_ke::NtsKeys, nts_ke::KeError> {
-    const KE_ATTEMPTS: u32 = 3;
-    let mut attempt = 1;
-    loop {
-        match nts_ke::key_exchange(host, port, timeout) {
-            Ok(k) => return Ok(k),
-            Err(e) if attempt < KE_ATTEMPTS => {
-                eprintln!("NTS-KE attempt {attempt} failed: {e}, retrying");
-                std::thread::sleep(Duration::from_secs(1));
-                attempt += 1;
-            }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -465,12 +465,4 @@ fn run_nts_ke(args: &Args) -> ExitCode {
         ms(t.exchange)
     );
     ExitCode::SUCCESS
-}
-
-fn fmt_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
 }

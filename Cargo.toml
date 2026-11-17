@@ -5,7 +5,12 @@ edition = "2024"
 
 [dependencies]
 aes-siv = "0.8.0"
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+lucide-icons = "1.73.0"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tray-icon = "0.26.1"
 webpki-roots = "1.0.12"
 windows-service = "0.8.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Services", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Services", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

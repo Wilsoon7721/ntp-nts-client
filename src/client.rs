@@ -95,6 +95,15 @@ pub fn resolve(server: &str) -> Result<SocketAddr, ClientError> {
         .ok_or_else(|| ClientError::Resolve(server.into()))
 }
 
+/// `host:port`, bracketing IPv6 addresses
+pub fn fmt_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 pub fn compute_offset_delay(
     t1: NtpTimestamp,
     t2: NtpTimestamp,
