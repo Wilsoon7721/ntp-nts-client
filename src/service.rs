@@ -16,7 +16,7 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
-use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS};
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfigW, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_NO_CHANGE,
     SERVICE_START_TYPE,
@@ -75,10 +75,44 @@ pub fn install() -> Result<(), String> {
         account_name: Some(ACCOUNT.into()),
         account_password: None,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-        .map_err(|e| format!("could not create the service: {}", describe(e)))?;
+    let service = match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG) {
+        Ok(s) => s,
+        // Installing over an older version: point the existing one at this exe
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_EXISTS as i32) =>
+        {
+            let s = manager
+                .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+                .map_err(|e| format!("could not open the service: {}", describe(e)))?;
+            s.change_config(&info)
+                .map_err(|e| format!("could not update the service: {}", describe(e)))?;
+            s
+        }
+        Err(e) => return Err(format!("could not create the service: {}", describe(e))),
+    };
     service.set_description(DESCRIPTION).map_err(describe)?;
+    Ok(())
+}
+
+/// Stops the service and waits, e.g. so an installer can replace the exe. Fine if it isn't installed.
+pub fn stop() -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("could not open the service manager: {}", describe(e)))?;
+    let service = match manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)
+    {
+        Ok(s) => s,
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(format!("could not open the service (run elevated): {}", describe(e))),
+    };
+    if state_of(&service)? != ServiceState::Stopped {
+        service.stop().map_err(describe)?;
+        wait_for(&service, ServiceState::Stopped, Duration::from_secs(40))?;
+    }
     Ok(())
 }
 

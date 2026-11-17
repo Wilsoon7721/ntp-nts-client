@@ -9,7 +9,7 @@ use nts_client::{clock, nts, nts_ke, service, sync, time};
 
 const USAGE: &str = "\
 Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts-ke | --sync [-p POLL_SECS]]
-       nts-client [--install] [--start] | --uninstall
+       nts-client [--install] [--start] | --stop | --uninstall
 
   SERVER   host, host:port, ip or [ipv6]:port (default: time.cloudflare.com)
   -n       number of samples, 2 s apart       (default: 4)
@@ -29,9 +29,10 @@ Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts
                Logs to %ProgramData%\\nts-client\\sync.log
   --start      stop and disable Windows Time so nothing restarts it, then
                start the service (nts-tray runs this after an admin prompt)
+  --stop       stop the service (the installer runs this before upgrading)
   --uninstall  stop and remove the service, and set Windows Time back to
                manual start
-  (all three need an elevated terminal)
+  (these need an elevated terminal)
 
 Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. The system clock is only changed with --set or --sync.";
 
@@ -46,6 +47,7 @@ struct Args {
     poll: Duration,
     install: bool,
     start: bool,
+    stop: bool,
     error_file: Option<String>,
     uninstall: bool,
     service: bool,
@@ -63,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
         poll: Duration::from_secs(64),
         install: false,
         start: false,
+        stop: false,
         error_file: None,
         uninstall: false,
         service: false,
@@ -77,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
             "--sync" => args.sync = true,
             "--install" => args.install = true,
             "--start" => args.start = true,
+            "--stop" => args.stop = true,
             "--error-file" => args.error_file = Some(it.next().ok_or("--error-file needs a path")?),
             "--uninstall" => args.uninstall = true,
             "--service" => args.service = true,
@@ -150,6 +154,12 @@ fn main() -> ExitCode {
                 println!("The {:?} service is running", service::SERVICE_NAME);
                 ExitCode::SUCCESS
             }
+            Err(e) => fail(e),
+        };
+    }
+    if args.stop {
+        return match service::stop() {
+            Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(e),
         };
     }
