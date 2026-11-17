@@ -9,7 +9,7 @@ use nts_client::{clock, nts, nts_ke, service, sync, time};
 
 const USAGE: &str = "\
 Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts-ke | --sync [-p POLL_SECS]]
-       nts-client [--install] [--start] | --stop | --uninstall
+       nts-client [--install] [--start] | --stop | --uninstall | --auto-timezone on|off
 
   SERVER   host, host:port, ip or [ipv6]:port (default: time.cloudflare.com)
   -n       number of samples, 2 s apart       (default: 4)
@@ -32,6 +32,9 @@ Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts
   --stop       stop the service (the installer runs this before upgrading)
   --uninstall  stop and remove the service, and set Windows Time back to
                manual start
+  --auto-timezone on|off
+               switch Windows' \"Set time zone automatically\" (nts-tray
+               runs this after an admin prompt)
   (these need an elevated terminal)
 
 Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. The system clock is only changed with --set or --sync.";
@@ -48,6 +51,7 @@ struct Args {
     install: bool,
     start: bool,
     stop: bool,
+    auto_timezone: Option<bool>,
     error_file: Option<String>,
     uninstall: bool,
     service: bool,
@@ -66,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         install: false,
         start: false,
         stop: false,
+        auto_timezone: None,
         error_file: None,
         uninstall: false,
         service: false,
@@ -81,6 +86,13 @@ fn parse_args() -> Result<Args, String> {
             "--install" => args.install = true,
             "--start" => args.start = true,
             "--stop" => args.stop = true,
+            "--auto-timezone" => {
+                args.auto_timezone = match it.next().as_deref() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => return Err("--auto-timezone needs on or off".into()),
+                }
+            }
             "--error-file" => args.error_file = Some(it.next().ok_or("--error-file needs a path")?),
             "--uninstall" => args.uninstall = true,
             "--service" => args.service = true,
@@ -154,6 +166,12 @@ fn main() -> ExitCode {
                 println!("The {:?} service is running", service::SERVICE_NAME);
                 ExitCode::SUCCESS
             }
+            Err(e) => fail(e),
+        };
+    }
+    if let Some(on) = args.auto_timezone {
+        return match service::set_auto_time_zone(on) {
+            Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(e),
         };
     }

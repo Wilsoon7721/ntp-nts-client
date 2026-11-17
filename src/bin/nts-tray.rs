@@ -179,6 +179,8 @@ enum UpdateState {
     },
 }
 
+type Slot<T> = Arc<Mutex<Option<T>>>;
+
 struct TrayApp {
     shared: Arc<Mutex<Shared>>,
     requests: Sender<Request>,
@@ -189,6 +191,8 @@ struct TrayApp {
     was_minimized: bool,
     zones: Vec<Zone>,
     zone_search: String,
+    /// An elevated change to automatic time zone, while it runs; then its result
+    zone_change: Option<Slot<Result<(), String>>>,
     autostart: bool,
     /// Why the last time zone or startup change failed
     settings_error: Option<String>,
@@ -284,6 +288,7 @@ impl TrayApp {
             was_minimized: false,
             zones: timezone::list(),
             zone_search: String::new(),
+            zone_change: None,
             autostart: autostart::is_enabled(),
             settings_error: None,
             update,
@@ -623,60 +628,123 @@ impl TrayApp {
 
     fn timezone_picker(&mut self, ui: &mut egui::Ui) {
         caption(ui, "Time zone");
+        // A finished admin-prompt change reports back here
+        let finished = self
+            .zone_change
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
+        if let Some(result) = finished {
+            self.zone_change = None;
+            self.settings_error = result.err();
+        }
+
+        let automatic = timezone::auto_update_on();
         let current = timezone::current();
         let selected = self
             .zones
             .iter()
             .position(|z| Some(&z.key) == current.as_ref());
-        let text = match selected {
+        let current_name = match selected {
             Some(i) => self.zones[i].display.clone(),
             None => current.unwrap_or_else(|| "—".into()),
         };
+        let text = if automatic {
+            "Automatic".to_string()
+        } else {
+            current_name.clone()
+        };
 
         let mut pick = None;
-        egui::ComboBox::from_id_salt("timezone")
-            .width(ui.available_width())
-            .height(360.0)
-            .selected_text(RichText::new(text).size(15.0))
-            .show_ui(ui, |ui| {
-                let search = ui.add(
-                    egui::TextEdit::singleline(&mut self.zone_search)
-                        .hint_text("Search, e.g. Singapore or UTC+08")
-                        .desired_width(f32::INFINITY),
-                );
-                if ui.memory(|m| m.focused().is_none()) {
-                    search.request_focus();
-                }
-                let query = self.zone_search.to_lowercase();
-                for (i, zone) in self.zones.iter().enumerate() {
-                    let matches = query.is_empty()
-                        || zone.display.to_lowercase().contains(&query)
-                        || zone.key.to_lowercase().contains(&query);
-                    if matches
-                        && ui
-                            .selectable_label(selected == Some(i), &zone.display)
-                            .clicked()
-                        && selected != Some(i)
-                    {
-                        pick = Some(i);
+        let busy = self.zone_change.is_some();
+        ui.add_enabled_ui(!busy, |ui| {
+            egui::ComboBox::from_id_salt("timezone")
+                .width(ui.available_width())
+                .height(360.0)
+                .selected_text(RichText::new(text).size(15.0))
+                .show_ui(ui, |ui| {
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut self.zone_search)
+                            .hint_text("Search, e.g. Singapore or UTC+08")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.memory(|m| m.focused().is_none()) {
+                        search.request_focus();
                     }
-                }
-            });
+                    let query = self.zone_search.to_lowercase();
+                    if ("automatic".contains(&query) || query.is_empty())
+                        && ui.selectable_label(automatic, "Automatic").clicked()
+                        && !automatic
+                    {
+                        pick = Some(ZonePick::Automatic);
+                    }
+                    for (i, zone) in self.zones.iter().enumerate() {
+                        let matches = query.is_empty()
+                            || zone.display.to_lowercase().contains(&query)
+                            || zone.key.to_lowercase().contains(&query);
+                        let is_selected = !automatic && selected == Some(i);
+                        if matches
+                            && ui.selectable_label(is_selected, &zone.display).clicked()
+                            && !is_selected
+                        {
+                            pick = Some(ZonePick::Zone(i));
+                        }
+                    }
+                });
+        });
 
-        if let Some(i) = pick {
-            self.zone_search.clear();
-            self.settings_error = timezone::set(&self.zones[i]).err();
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Approve the Windows prompt to continue...").weak());
+            });
+        } else {
+            ui.label(RichText::new(format!("Selected: {current_name}")).small().weak());
+            if automatic && !timezone::location_allowed() {
+                ui.label(
+                    RichText::new(
+                        "Location access is off in Windows Settings, so Automatic can't \
+                         detect your time zone.",
+                    )
+                    .small()
+                    .color(WARN),
+                );
+            }
         }
-        if timezone::auto_update_on() {
-            ui.label(
-                RichText::new(
-                    "\"Set time zone automatically\" is on in Windows Settings, so Windows may \
-                     change this back.",
-                )
-                .small()
-                .color(WARN),
-            );
+
+        match pick {
+            Some(ZonePick::Automatic) => {
+                self.zone_search.clear();
+                self.change_zone_elevated(ui.ctx(), None);
+            }
+            // Automatic would change it back so it's switched off first
+            Some(ZonePick::Zone(i)) if automatic => {
+                self.zone_search.clear();
+                self.change_zone_elevated(ui.ctx(), Some(self.zones[i].clone()));
+            }
+            Some(ZonePick::Zone(i)) => {
+                self.zone_search.clear();
+                self.settings_error = timezone::set(&self.zones[i]).err();
+            }
+            None => {}
         }
+    }
+
+    /// Turns automatic time zone on (`None`), or off and then sets `zone`. Changing it needs administrator permission.
+    fn change_zone_elevated(&mut self, ctx: &egui::Context, zone: Option<Zone>) {
+        let slot = Arc::new(Mutex::new(None));
+        let (out, ctx) = (slot.clone(), ctx.clone());
+        thread::spawn(move || {
+            let result = match &zone {
+                None => run_elevated("--auto-timezone on"),
+                Some(zone) => run_elevated("--auto-timezone off").and_then(|()| timezone::set(zone)),
+            };
+            if let Ok(mut r) = out.lock() {
+                *r = Some(result);
+            }
+            ctx.request_repaint();
+        });
+        self.settings_error = None;
+        self.zone_change = Some(slot);
     }
 
     fn startup_toggle(&mut self, ui: &mut egui::Ui) {
@@ -832,6 +900,11 @@ impl TrayApp {
             failed,
         };
     }
+}
+
+enum ZonePick {
+    Automatic,
+    Zone(usize),
 }
 
 enum UpdateAction {

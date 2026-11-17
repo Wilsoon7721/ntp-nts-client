@@ -32,6 +32,8 @@ const DISPLAY_NAME: &str = "NTS Client";
 const DESCRIPTION: &str = "Keeps the system clock in sync using NTS-authenticated NTP.";
 const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
 const W32TIME: &str = "W32Time";
+/// The service behind Windows' "Set time zone automatically"
+const TZ_AUTO_UPDATE: &str = "tzautoupdate";
 /// Log is moved to `sync.log.old` past this size
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
@@ -227,6 +229,28 @@ pub fn w32time_disabled() -> Result<bool, String> {
         None => Ok(true),
         Some(s) => Ok(s.query_config().map_err(describe)?.start_type == ServiceStartType::Disabled),
     }
+}
+
+/// Turns Windows' "Set time zone automatically" on or off
+pub fn set_auto_time_zone(on: bool) -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("could not open the service manager: {}", describe(e)))?;
+    let access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::CHANGE_CONFIG;
+    let service = manager
+        .open_service(TZ_AUTO_UPDATE, access)
+        .map_err(|e| format!("could not open the automatic time zone service (run elevated): {}", describe(e)))?;
+    let start_type = if on { SERVICE_DEMAND_START } else { SERVICE_DISABLED };
+    set_start_type(&service, start_type)
+        .map_err(|e| format!("could not change automatic time zone: {e}"))?;
+    if on {
+        let _ = service.start::<&str>(&[]);
+    } else if state_of(&service)? != ServiceState::Stopped {
+        let _ = service.stop();
+    }
+    Ok(())
 }
 
 /// Changes only the start type; `windows_service`'s `change_config` wants every field
