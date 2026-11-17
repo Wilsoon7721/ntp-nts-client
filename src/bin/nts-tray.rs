@@ -8,28 +8,30 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lucide_icons::Icon;
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Margin, RichText,
-    Stroke, Theme, ViewportCommand, Visuals,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Margin, RichText, Stroke,
+    Theme, ViewportCommand, Visuals,
 };
+use lucide_icons::Icon;
 use serde::{Deserialize, Serialize};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows_service::service::ServiceState;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, SYSTEMTIME};
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+use nts_client::autostart;
 use nts_client::config::CUSTOM_ID;
 use nts_client::ipc::{self, Reply, Request};
 use nts_client::probe::{self, Probe};
-use nts_client::service;
 use nts_client::servers::{self, Protocol, Server};
+use nts_client::service;
+use nts_client::timezone::{self, Zone};
 
 /// How often the service is asked for its status
 const POLL: Duration = Duration::from_secs(2);
@@ -47,8 +49,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NTS Client")
-            .with_inner_size([420.0, 560.0])
-            .with_min_inner_size([360.0, 480.0])
+            .with_inner_size([420.0, 660.0])
+            .with_min_inner_size([360.0, 520.0])
             .with_visible(!start_hidden)
             .with_icon(egui::IconData {
                 rgba: rgba.clone(),
@@ -72,6 +74,9 @@ fn main() -> eframe::Result {
 struct Prefs {
     #[serde(default)]
     skip_ntp_warning: bool,
+    /// "Start with Windows" is switched on once, the first time the app runs
+    #[serde(default)]
+    autostart_set_up: bool,
 }
 
 impl Prefs {
@@ -112,6 +117,8 @@ struct Shared {
     service: Option<Result<Option<ServiceState>, String>>,
     /// The elevated `nts-client --start` helper
     helper: Helper,
+    /// Whether Windows Time is disabled, so it can't fight the service over the clock
+    w32time_disabled: Option<bool>,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -127,6 +134,8 @@ enum Helper {
 enum ServiceAction {
     Start,
     InstallAndStart,
+    /// `--start` also disables Windows Time
+    DisableW32Time,
 }
 
 /// A plain NTP server waiting for the user to accept the risk
@@ -160,6 +169,11 @@ struct TrayApp {
     show: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
     was_minimized: bool,
+    zones: Vec<Zone>,
+    zone_search: String,
+    autostart: bool,
+    /// Why the last time zone or startup change failed
+    settings_error: Option<String>,
     /// Removed from the tray when dropped
     _tray: TrayIcon,
 }
@@ -220,14 +234,27 @@ impl TrayApp {
             thread::spawn(move || talk_to_service(request_rx, shared, ctx));
         }
 
+        let mut prefs = Prefs::load();
+        if !prefs.autostart_set_up {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = autostart::enable(&exe);
+            }
+            prefs.autostart_set_up = true;
+            prefs.save();
+        }
+
         Ok(Self {
             shared,
             requests,
             dialog: Dialog::None,
-            prefs: Prefs::load(),
+            prefs,
             show,
             quit,
             was_minimized: false,
+            zones: timezone::list(),
+            zone_search: String::new(),
+            autostart: autostart::is_enabled(),
+            settings_error: None,
             _tray: tray,
         })
     }
@@ -291,7 +318,9 @@ fn talk_to_service(requests: Receiver<Request>, shared: Arc<Mutex<Shared>>, ctx:
         };
         let is_change = !matches!(request, Request::Status);
         let result = ipc::request(ipc::PIPE_NAME, &request);
+        let w32time_disabled = service::w32time_disabled().ok();
         if let Ok(mut s) = shared.lock() {
+            s.w32time_disabled = w32time_disabled;
             match result {
                 Ok(reply) => {
                     if is_change {
@@ -331,6 +360,8 @@ impl eframe::App for TrayApp {
             return;
         }
         if self.show.swap(false, Ordering::Relaxed) {
+            // May have been changed from Task Manager while hidden
+            self.autostart = autostart::is_enabled();
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -352,17 +383,22 @@ impl eframe::App for TrayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let (reply, unreachable, refused, pending, svc, helper) = match self.shared.lock() {
-            Ok(s) => (
-                s.reply.clone(),
-                s.unreachable.clone(),
-                s.refused.clone(),
-                s.pending.clone(),
-                s.service.clone(),
-                s.helper.clone(),
-            ),
-            Err(_) => (None, Some("internal error".into()), None, None, None, Helper::Idle),
-        };
+        let (reply, unreachable, refused, pending, svc, helper, w32time_disabled) =
+            match self.shared.lock() {
+                Ok(s) => (
+                    s.reply.clone(),
+                    s.unreachable.clone(),
+                    s.refused.clone(),
+                    s.pending.clone(),
+                    s.service.clone(),
+                    s.helper.clone(),
+                    s.w32time_disabled,
+                ),
+                Err(_) => {
+                    let e = Some("internal error".into());
+                    (None, e, None, None, None, Helper::Idle, None)
+                }
+            };
         let connected = unreachable.is_none() && reply.is_some();
 
         let mut picked = None;
@@ -371,16 +407,32 @@ impl eframe::App for TrayApp {
             .fill(ui.visuals().panel_fill)
             .inner_margin(Margin::same(16));
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 12.0;
-            card(ui, clock);
-            card(ui, |ui| {
-                action = status(ui, reply.as_ref(), unreachable.as_deref(), svc.as_ref(), &helper);
-            });
-            card(ui, |ui| {
-                picked = server_picker(ui, reply.as_ref(), connected, pending.as_deref());
-                if let Some(e) = &refused {
-                    ui.colored_label(BAD, format!("Not changed: {e}"));
-                }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                card(ui, clock);
+                card(ui, |ui| {
+                    action = status(
+                        ui,
+                        reply.as_ref(),
+                        unreachable.as_deref(),
+                        svc.as_ref(),
+                        &helper,
+                        w32time_disabled,
+                    );
+                });
+                card(ui, |ui| {
+                    picked = server_picker(ui, reply.as_ref(), connected, pending.as_deref());
+                    if let Some(e) = &refused {
+                        ui.colored_label(BAD, format!("Not changed: {e}"));
+                    }
+                    ui.add_space(6.0);
+                    self.timezone_picker(ui);
+                    ui.add_space(6.0);
+                    self.startup_toggle(ui);
+                    if let Some(e) = &self.settings_error {
+                        ui.colored_label(BAD, e);
+                    }
+                });
             });
         });
 
@@ -419,7 +471,7 @@ impl eframe::App for TrayApp {
 impl TrayApp {
     fn run_helper(&self, ctx: &egui::Context, action: ServiceAction) {
         let args = match action {
-            ServiceAction::Start => "--start",
+            ServiceAction::Start | ServiceAction::DisableW32Time => "--start",
             ServiceAction::InstallAndStart => "--install --start",
         };
         if let Ok(mut s) = self.shared.lock() {
@@ -438,6 +490,84 @@ impl TrayApp {
             }
             ctx.request_repaint();
         });
+    }
+
+    fn timezone_picker(&mut self, ui: &mut egui::Ui) {
+        caption(ui, "Time zone");
+        let current = timezone::current();
+        let selected = self
+            .zones
+            .iter()
+            .position(|z| Some(&z.key) == current.as_ref());
+        let text = match selected {
+            Some(i) => self.zones[i].display.clone(),
+            None => current.unwrap_or_else(|| "—".into()),
+        };
+
+        let mut pick = None;
+        egui::ComboBox::from_id_salt("timezone")
+            .width(ui.available_width())
+            .height(360.0)
+            .selected_text(RichText::new(text).size(15.0))
+            .show_ui(ui, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.zone_search)
+                        .hint_text("Search, e.g. Singapore or UTC+08")
+                        .desired_width(f32::INFINITY),
+                );
+                if ui.memory(|m| m.focused().is_none()) {
+                    search.request_focus();
+                }
+                let query = self.zone_search.to_lowercase();
+                for (i, zone) in self.zones.iter().enumerate() {
+                    let matches = query.is_empty()
+                        || zone.display.to_lowercase().contains(&query)
+                        || zone.key.to_lowercase().contains(&query);
+                    if matches
+                        && ui
+                            .selectable_label(selected == Some(i), &zone.display)
+                            .clicked()
+                        && selected != Some(i)
+                    {
+                        pick = Some(i);
+                    }
+                }
+            });
+
+        if let Some(i) = pick {
+            self.zone_search.clear();
+            self.settings_error = timezone::set(&self.zones[i]).err();
+        }
+        if timezone::auto_update_on() {
+            ui.label(
+                RichText::new(
+                    "\"Set time zone automatically\" is on in Windows Settings, so Windows may \
+                     change this back.",
+                )
+                .small()
+                .color(WARN),
+            );
+        }
+    }
+
+    fn startup_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.autostart;
+        if ui.checkbox(&mut on, "Start with Windows").changed() {
+            let result = if on {
+                std::env::current_exe().and_then(|exe| autostart::enable(&exe))
+            } else {
+                autostart::disable()
+            };
+            self.settings_error = result
+                .err()
+                .map(|e| format!("Could not change the startup setting: {e}"));
+            self.autostart = autostart::is_enabled();
+        }
+        ui.label(
+            RichText::new("Opens in the tray when you sign in.")
+                .small()
+                .weak(),
+        );
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -506,8 +636,10 @@ impl TrayApp {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(RichText::new("Custom server").size(18.0).strong());
             ui.label(
-                RichText::new("Enter a hostname or IP address. NTS is tried first, then plain NTP.")
-                    .weak(),
+                RichText::new(
+                    "Enter a hostname or IP address. NTS is tried first, then plain NTP.",
+                )
+                .weak(),
             );
 
             let busy = checking.is_some();
@@ -731,13 +863,17 @@ fn status(
     unreachable: Option<&str>,
     svc: Option<&Result<Option<ServiceState>, String>>,
     helper: &Helper,
+    w32time_disabled: Option<bool>,
 ) -> Option<ServiceAction> {
     let Some(reply) = reply.filter(|_| unreachable.is_none()) else {
         return service_down(ui, unreachable, svc, helper);
     };
 
     let s = &reply.status;
-    let healthy = matches!(s.state.as_str(), "Synced" | "Measuring drift" | "Stepped the clock");
+    let healthy = matches!(
+        s.state.as_str(),
+        "Synced" | "Measuring drift" | "Stepped the clock"
+    );
     ui.horizontal(|ui| {
         dot(ui, if healthy { GOOD } else { WARN });
         ui.label(RichText::new(&s.state).size(16.0).strong());
@@ -753,9 +889,21 @@ fn status(
 
     ui.add_space(4.0);
     ui.columns(3, |cols| {
-        stat(&mut cols[0], "Offset", s.offset_ms.map(|o| format!("{o:+.2} ms")));
-        stat(&mut cols[1], "Delay", s.delay_ms.map(|d| format!("{d:.1} ms")));
-        stat(&mut cols[2], "Drift", s.freq_ppm.map(|f| format!("{f:+.2} ppm")));
+        stat(
+            &mut cols[0],
+            "Offset",
+            s.offset_ms.map(|o| format!("{o:+.2} ms")),
+        );
+        stat(
+            &mut cols[1],
+            "Delay",
+            s.delay_ms.map(|d| format!("{d:.1} ms")),
+        );
+        stat(
+            &mut cols[2],
+            "Drift",
+            s.freq_ppm.map(|f| format!("{f:+.2} ppm")),
+        );
     });
     if let Some(t) = s.last_sync {
         let now = SystemTime::now()
@@ -768,7 +916,38 @@ fn status(
                 .weak(),
         );
     }
+    if w32time_disabled == Some(false) {
+        return w32time_warning(ui, helper);
+    }
     None
+}
+
+/// Windows Time can be started again by Windows and would clash
+fn w32time_warning(ui: &mut egui::Ui, helper: &Helper) -> Option<ServiceAction> {
+    let why = "Windows can start the default Windows Time Service again (via \"Sync now\" in Settings or a weekly task), and it would clash with this service regarding the clock. Disabling the service needs administrator permissions.";
+    let mut pressed = None;
+    ui.horizontal(|ui| {
+        ui.label(icon(Icon::TriangleAlert).color(WARN))
+            .on_hover_text(why);
+        ui.label(RichText::new("Windows Time Service isn't disabled").color(WARN))
+            .on_hover_text(why);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if *helper == Helper::Running {
+                ui.spinner()
+                    .on_hover_text("Approve the Windows prompt to continue");
+            } else if ui
+                .add(accent_button("Disable"))
+                .on_hover_text(why)
+                .clicked()
+            {
+                pressed = Some(ServiceAction::DisableW32Time);
+            }
+        });
+    });
+    if let Helper::Failed(e) = helper {
+        ui.colored_label(BAD, e);
+    }
+    pressed
 }
 
 /// Why the service can't be reached
@@ -797,12 +976,16 @@ fn service_down(
             "Your clock isn't being kept in sync.".to_string(),
             Some((ServiceAction::Start, "Start service")),
         ),
-        Some(Ok(Some(ServiceState::StartPending))) => {
-            ("Service starting", "Waiting for it to answer...".to_string(), None)
-        }
-        Some(Ok(Some(ServiceState::StopPending))) => {
-            ("Service stopping", "Waiting for it to stop...".to_string(), None)
-        }
+        Some(Ok(Some(ServiceState::StartPending))) => (
+            "Service starting",
+            "Waiting for it to answer...".to_string(),
+            None,
+        ),
+        Some(Ok(Some(ServiceState::StopPending))) => (
+            "Service stopping",
+            "Waiting for it to stop...".to_string(),
+            None,
+        ),
         Some(Ok(Some(_))) => (
             "Service not answering",
             format!("It's running, but the connection failed: {unreachable}"),
@@ -832,7 +1015,11 @@ fn service_down(
                 if ui.add(accent_button(label)).clicked() {
                     pressed = Some(action);
                 }
-                ui.label(RichText::new("Needs administrator permission").small().weak());
+                ui.label(
+                    RichText::new("Needs administrator permission")
+                        .small()
+                        .weak(),
+                );
             }
             if let Helper::Failed(e) = helper {
                 ui.colored_label(BAD, e);
@@ -1000,8 +1187,10 @@ fn server_picker(
                 "Plain NTP: replies aren't signed, so the time could be faked on the way.",
             )
             .color(WARN),
-            _ => RichText::new("NTS signs every reply, so nobody on the network can fake the time.")
-                .weak(),
+            _ => {
+                RichText::new("NTS signs every reply, so nobody on the network can fake the time.")
+                    .weak()
+            }
         };
         ui.label(note.small());
     }
@@ -1010,8 +1199,9 @@ fn server_picker(
 
 fn style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let windows_fonts = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
-        .join("Fonts");
+    let windows_fonts =
+        PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("Fonts");
     let load = |file: &str| fs::read(windows_fonts.join(file)).ok();
     if let Some(regular) = load("segoeui.ttf") {
         fonts
@@ -1030,7 +1220,9 @@ fn style(ctx: &egui::Context) {
         let fallback = fonts.families[&FontFamily::Proportional].clone();
         fonts.families.insert(
             FontFamily::Name("light".into()),
-            std::iter::once("segoe-light".to_string()).chain(fallback).collect(),
+            std::iter::once("segoe-light".to_string())
+                .chain(fallback)
+                .collect(),
         );
     }
     fonts.font_data.insert(

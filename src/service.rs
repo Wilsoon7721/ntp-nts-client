@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::ptr;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
@@ -16,6 +17,10 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use windows_sys::Win32::System::Services::{
+    ChangeServiceConfigW, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_NO_CHANGE,
+    SERVICE_START_TYPE,
+};
 
 use crate::config::{self, Config, CustomServer};
 use crate::ipc::{self, Client, Reply, Request};
@@ -26,6 +31,7 @@ pub const SERVICE_NAME: &str = "nts-client";
 const DISPLAY_NAME: &str = "NTS Client";
 const DESCRIPTION: &str = "Keeps the system clock in sync using NTS-authenticated NTP.";
 const ACCOUNT: &str = r"NT AUTHORITY\LocalService";
+const W32TIME: &str = "W32Time";
 /// Log is moved to `sync.log.old` past this size
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
@@ -34,8 +40,6 @@ define_windows_service!(ffi_service_main, service_main);
 /// Registers the service
 pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // Files under a user profile are only readable by that user, SYSTEM and
-    // Administrators, so LOCAL SERVICE couldn't even launch the exe
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         let exe_lower = exe.to_string_lossy().to_lowercase();
         let profile_lower = profile.to_string_lossy().to_lowercase();
@@ -94,24 +98,17 @@ pub fn uninstall() -> Result<(), String> {
         // A burst in progress can take ~20 s to notice the stop
         wait_for(&service, ServiceState::Stopped, Duration::from_secs(40))?;
     }
-    service.delete().map_err(describe)
+    service.delete().map_err(describe)?;
+    restore_w32time(&manager)
+        .map_err(|e| format!("removed the service, but could not re-enable Windows Time: {e}"))
 }
 
-/// Stops Windows Time if it's running, then starts the service
+/// Stops and disables Windows Time, then starts the service
 pub fn start() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| format!("could not open the service manager: {}", describe(e)))?;
 
-    if let Ok(w32time) = manager.open_service(
-        "W32Time",
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
-    ) && state_of(&w32time)? != ServiceState::Stopped
-    {
-        w32time
-            .stop()
-            .map_err(|e| format!("could not stop Windows Time (run elevated): {}", describe(e)))?;
-        wait_for(&w32time, ServiceState::Stopped, Duration::from_secs(30))?;
-    }
+    disable_w32time(&manager)?;
 
     let service = manager
         .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::START)
@@ -137,6 +134,88 @@ pub fn query() -> Result<Option<ServiceState>, String> {
         }
         Err(e) => Err(describe(e)),
     }
+}
+
+/// Opens Windows Time; `Ok(None)` if this Windows doesn't have it
+fn open_w32time(manager: &ServiceManager, access: ServiceAccess) -> Result<Option<Service>, String> {
+    match manager.open_service(W32TIME, access) {
+        Ok(s) => Ok(Some(s)),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(format!("could not open Windows Time (run elevated): {}", describe(e))),
+    }
+}
+
+/// Disabling, not just stopping, keeps it down: otherwise its domain-join
+/// trigger, the weekly "SynchronizeTime" scheduled task, or "Sync now" in
+/// Settings start it again and it fights the service over the clock
+fn disable_w32time(manager: &ServiceManager) -> Result<(), String> {
+    let access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::STOP
+        | ServiceAccess::QUERY_CONFIG
+        | ServiceAccess::CHANGE_CONFIG;
+    let Some(w32time) = open_w32time(manager, access)? else {
+        return Ok(());
+    };
+    if w32time.query_config().map_err(describe)?.start_type != ServiceStartType::Disabled {
+        set_start_type(&w32time, SERVICE_DISABLED)
+            .map_err(|e| format!("could not disable Windows Time: {e}"))?;
+    }
+    if state_of(&w32time)? != ServiceState::Stopped {
+        w32time
+            .stop()
+            .map_err(|e| format!("could not stop Windows Time: {}", describe(e)))?;
+        wait_for(&w32time, ServiceState::Stopped, Duration::from_secs(30))?;
+    }
+    Ok(())
+}
+
+/// Back to Windows' default (manual, started by its triggers), if we disabled it
+fn restore_w32time(manager: &ServiceManager) -> Result<(), String> {
+    let access = ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG;
+    let Some(w32time) = open_w32time(manager, access)? else {
+        return Ok(());
+    };
+    if w32time.query_config().map_err(describe)?.start_type == ServiceStartType::Disabled {
+        set_start_type(&w32time, SERVICE_DEMAND_START)?;
+    }
+    Ok(())
+}
+
+/// Whether Windows Time is disabled (or absent). Read-only, works without admin rights.
+pub fn w32time_disabled() -> Result<bool, String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(describe)?;
+    match open_w32time(&manager, ServiceAccess::QUERY_CONFIG)? {
+        None => Ok(true),
+        Some(s) => Ok(s.query_config().map_err(describe)?.start_type == ServiceStartType::Disabled),
+    }
+}
+
+/// Changes only the start type; `windows_service`'s `change_config` wants every field
+fn set_start_type(service: &Service, start_type: SERVICE_START_TYPE) -> Result<(), String> {
+    let ok = unsafe {
+        ChangeServiceConfigW(
+            service.raw_handle(),
+            SERVICE_NO_CHANGE,
+            start_type,
+            SERVICE_NO_CHANGE,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
 }
 
 fn state_of(service: &Service) -> Result<ServiceState, String> {

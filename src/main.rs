@@ -27,9 +27,10 @@ Usage: nts-client [SERVER] [-n SAMPLES] [-t TIMEOUT_SECS] [--nts [--set] | --nts
   --install    register --sync as a Windows service (\"NTS Client\") that
                starts at boot. Pick its server with nts-tray.
                Logs to %ProgramData%\\nts-client\\sync.log
-  --start      stop Windows Time if it's running, then start the service
-               (nts-tray runs this for you, after a Windows admin prompt)
-  --uninstall  stop and remove the service
+  --start      stop and disable Windows Time so nothing restarts it, then
+               start the service (nts-tray runs this after an admin prompt)
+  --uninstall  stop and remove the service, and set Windows Time back to
+               manual start
   (all three need an elevated terminal)
 
 Measures how far this machine's clock is from SERVER using plain NTP, or NTS with --nts. The system clock is only changed with --set or --sync.";

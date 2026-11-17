@@ -4,14 +4,14 @@ use std::mem;
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows_sys::core::{w, BOOL};
+use windows_sys::core::{w, BOOL, PCWSTR};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED, ERROR_SERVICE_DOES_NOT_EXIST, FILETIME,
     HANDLE, LUID, SYSTEMTIME,
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    SE_SYSTEMTIME_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    SE_SYSTEMTIME_NAME, SE_TIME_ZONE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Services::{
@@ -58,6 +58,16 @@ fn last_error(call: &'static str) -> ClockError {
 
 /// Switches on `SeSystemtimePrivilege` for this process
 pub fn enable_privilege() -> Result<(), ClockError> {
+    enable_named_privilege(SE_SYSTEMTIME_NAME)
+}
+
+/// Switches on `SeTimeZonePrivilege`, which standard users hold too
+pub fn enable_time_zone_privilege() -> Result<(), ClockError> {
+    enable_named_privilege(SE_TIME_ZONE_NAME)
+}
+
+/// Switches on a privilege the process token holds but has disabled
+fn enable_named_privilege(name: PCWSTR) -> Result<(), ClockError> {
     unsafe {
         let mut token: HANDLE = ptr::null_mut();
         if OpenProcessToken(
@@ -71,7 +81,7 @@ pub fn enable_privilege() -> Result<(), ClockError> {
 
         let result = (|| {
             let mut luid: LUID = mem::zeroed();
-            if LookupPrivilegeValueW(ptr::null(), SE_SYSTEMTIME_NAME, &mut luid) == 0 {
+            if LookupPrivilegeValueW(ptr::null(), name, &mut luid) == 0 {
                 return Err(last_error("LookupPrivilegeValueW"));
             }
             let privileges = TOKEN_PRIVILEGES {
@@ -81,14 +91,8 @@ pub fn enable_privilege() -> Result<(), ClockError> {
                     Attributes: SE_PRIVILEGE_ENABLED,
                 }],
             };
-            let ok = AdjustTokenPrivileges(
-                token,
-                0,
-                &privileges,
-                0,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
+            let ok =
+                AdjustTokenPrivileges(token, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut());
             if ok == 0 {
                 return Err(last_error("AdjustTokenPrivileges"));
             }
