@@ -23,7 +23,7 @@ use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObj
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SW_HIDE};
 
 use nts_client::autostart;
 use nts_client::config::CUSTOM_ID;
@@ -49,18 +49,15 @@ const BAD: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 
 fn main() -> eframe::Result {
     let start_hidden = std::env::args().any(|a| a == "--hidden");
-    let (rgba, size) = icon_rgba();
+    let window_icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-256.png"))
+        .expect("the bundled icon is a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NTS Client")
             .with_inner_size([420.0, 660.0])
             .with_min_inner_size([360.0, 520.0])
             .with_visible(!start_hidden)
-            .with_icon(egui::IconData {
-                rgba: rgba.clone(),
-                width: size,
-                height: size,
-            }),
+            .with_icon(window_icon),
         ..Default::default()
     };
     eframe::run_native(
@@ -68,7 +65,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             style(&cc.egui_ctx);
-            Ok(Box::new(TrayApp::new(&cc.egui_ctx, rgba, size)?))
+            Ok(Box::new(TrayApp::new(&cc.egui_ctx)?))
         }),
     )
 }
@@ -206,8 +203,6 @@ struct TrayApp {
 impl TrayApp {
     fn new(
         ctx: &egui::Context,
-        rgba: Vec<u8>,
-        size: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let show = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -220,7 +215,7 @@ impl TrayApp {
 
         let tray = TrayIconBuilder::new()
             .with_tooltip("NTS Client")
-            .with_icon(tray_icon::Icon::from_rgba(rgba, size, size)?)
+            .with_icon(tray_icon_image()?)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .build()?;
@@ -1503,36 +1498,9 @@ fn light_family(ui: &egui::Ui) -> FontFamily {
     }
 }
 
-/// A 32×32 clock face for the tray and window icon
-fn icon_rgba() -> (Vec<u8>, u32) {
-    const N: u32 = 32;
-    let c = (N as f32 - 1.0) / 2.0;
-    let mut rgba = vec![0u8; (N * N * 4) as usize];
-    // Hands at 10:10, as distances from the centre along each direction
-    let hands = [(-0.81f32, -0.59f32, 8.0f32), (0.81, -0.59, 11.0)];
-    for y in 0..N {
-        for x in 0..N {
-            let (dx, dy) = (x as f32 - c, y as f32 - c);
-            let r = (dx * dx + dy * dy).sqrt();
-            let on_hand = hands.iter().any(|&(hx, hy, len)| {
-                let along = dx * hx + dy * hy;
-                let across = (dx * hy - dy * hx).abs();
-                (0.0..=len).contains(&along) && across < 1.3
-            });
-            let colour = if r > 15.5 {
-                None
-            } else if r > 13.0 {
-                Some([0x2b, 0x6c, 0xb0]) // rim
-            } else if on_hand || r < 2.0 {
-                Some([0x1a, 0x1a, 0x1a])
-            } else {
-                Some([0xfa, 0xfa, 0xfa]) // face
-            };
-            if let Some([red, green, blue]) = colour {
-                let i = ((y * N + x) * 4) as usize;
-                rgba[i..i + 4].copy_from_slice(&[red, green, blue, 0xff]);
-            }
-        }
-    }
-    (rgba, N)
+/// The exe's own icon (resource 1, from assets/icon.ico) at the tray's size
+/// for this display's scaling, so Windows picks the sharpest image in the .ico
+fn tray_icon_image() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) as u32;
+    tray_icon::Icon::from_resource(1, Some((size, size)))
 }
