@@ -114,7 +114,7 @@ pub trait Protection {
     fn verify(&mut self, packet: &NtpPacket, raw: &[u8]) -> Result<(), ClientError>;
 }
 
-/// Regular NTP
+/// Unauthenticated NTP
 pub struct Plain;
 
 impl Protection for Plain {

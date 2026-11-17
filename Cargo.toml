@@ -7,4 +7,5 @@ edition = "2024"
 aes-siv = "0.8.0"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 webpki-roots = "1.0.12"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time"] }
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Services", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time"] }
