@@ -2212,6 +2212,7 @@ dependencies = [
  "aes-siv",
  "eframe",
  "lucide-icons",
+ "raw-window-handle",
  "ring",
  "rustls",
  "rustls-platform-verifier",

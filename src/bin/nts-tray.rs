@@ -13,11 +13,13 @@ use eframe::egui::{
     Theme, ViewportCommand, Visuals,
 };
 use lucide_icons::Icon;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows_service::service::ServiceState;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HWND, SYSTEMTIME};
+use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{
@@ -54,14 +56,15 @@ const BAD: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 
 fn main() -> eframe::Result {
     let start_hidden = std::env::args().any(|a| a == "--hidden");
-    let window_icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-256.png"))
-        .expect("the bundled icon is a valid PNG");
+    let window_icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-256.png"))
+            .expect("the bundled icon is a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NTS Client")
             .with_inner_size([420.0, 660.0])
             .with_min_inner_size([360.0, 520.0])
-            .with_visible(!start_hidden)
+            .with_active(!start_hidden)
             .with_icon(window_icon),
         ..Default::default()
     };
@@ -70,9 +73,35 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             style(&cc.egui_ctx);
-            Ok(Box::new(TrayApp::new(&cc.egui_ctx)?))
+            // Cloaked, the window can be "shown" without appearing on screen or
+            // in the taskbar, until the tray icon opens it
+            let cloaked = start_hidden.then(|| window_hwnd(cc)).flatten();
+            if let Some(hwnd) = cloaked {
+                set_cloaked(hwnd, true);
+            }
+            Ok(Box::new(TrayApp::new(&cc.egui_ctx, start_hidden, cloaked)?))
         }),
     )
+}
+
+fn window_hwnd(cc: &eframe::CreationContext) -> Option<HWND> {
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+        _ => None,
+    }
+}
+
+/// A cloaked window isn't drawn or listed in the taskbar, even while visible
+fn set_cloaked(hwnd: HWND, cloaked: bool) {
+    let value: i32 = cloaked.into();
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK as u32,
+            (&raw const value).cast(),
+            size_of::<i32>() as u32,
+        );
+    }
 }
 
 /// Per-user settings for the tray app, in `%APPDATA%\nts-client\tray.json`
@@ -206,6 +235,10 @@ struct TrayApp {
     show: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
     was_minimized: bool,
+    /// Started with --hidden: undo eframe showing the window after its first frame
+    hide_at_start: bool,
+    /// The window while it's cloaked by a hidden start
+    cloaked: Option<HWND>,
     zones: Vec<Zone>,
     zone_search: String,
     /// An elevated change to automatic time zone, while it runs; then its result
@@ -229,6 +262,8 @@ struct TrayApp {
 impl TrayApp {
     fn new(
         ctx: &egui::Context,
+        start_hidden: bool,
+        cloaked: Option<HWND>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let show = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
@@ -316,6 +351,8 @@ impl TrayApp {
             show,
             quit,
             was_minimized: false,
+            hide_at_start: start_hidden,
+            cloaked,
             zones: timezone::list(),
             zone_search: String::new(),
             zone_change: None,
@@ -515,7 +552,11 @@ impl eframe::App for TrayApp {
         }
         let update_ready = matches!(
             self.update.lock().as_deref(),
-            Ok(UpdateState::Available(_) | UpdateState::Failed { release: Some(_), .. })
+            Ok(UpdateState::Available(_)
+                | UpdateState::Failed {
+                    release: Some(_),
+                    ..
+                })
         );
         if update_ready != self.tooltip_says_update {
             let tooltip = if update_ready {
@@ -527,6 +568,9 @@ impl eframe::App for TrayApp {
             self.tooltip_says_update = update_ready;
         }
         if self.show.swap(false, Ordering::Relaxed) {
+            if let Some(hwnd) = self.cloaked.take() {
+                set_cloaked(hwnd, false);
+            }
             // May have been changed from Task Manager while hidden
             self.autostart = autostart::is_enabled();
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -550,6 +594,13 @@ impl eframe::App for TrayApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe shows the window after drawing its first frame, whatever the
+        // viewport asked for, then carries out that frame's commands. ui()
+        // only runs on drawn frames, so hiding here undoes the show at once.
+        if self.hide_at_start {
+            self.hide_at_start = false;
+            ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+        }
         let (reply, unreachable, refused, pending, svc, helper, w32time_disabled) =
             match self.shared.lock() {
                 Ok(s) => (
@@ -583,7 +634,9 @@ impl eframe::App for TrayApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
                 if let Some(release) = offered_release(&update_state) {
-                    card(ui, |ui| update_action = update_banner(ui, release, &update_state));
+                    card(ui, |ui| {
+                        update_action = update_banner(ui, release, &update_state)
+                    });
                 }
                 card(ui, clock);
                 card(ui, |ui| {
@@ -747,7 +800,9 @@ impl TrayApp {
             .map(|d| d.clone())
             .unwrap_or(Detect::Idle);
         let visuals = ui.visuals();
-        let subtle = visuals.weak_text_color().lerp_to_gamma(visuals.text_color(), 0.4);
+        let subtle = visuals
+            .weak_text_color()
+            .lerp_to_gamma(visuals.text_color(), 0.4);
         // The dropdown and the lines under it sit close together
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
@@ -790,7 +845,11 @@ impl TrayApp {
             if busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Approve the Windows prompt to continue...").small().color(subtle));
+                    ui.label(
+                        RichText::new("Approve the Windows prompt to continue...")
+                            .small()
+                            .color(subtle),
+                    );
                 });
             } else {
                 if self.prefs.auto_time_zone {
@@ -798,20 +857,30 @@ impl TrayApp {
                         Detect::Detecting => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(RichText::new("Finding your location...").small().color(subtle));
+                                ui.label(
+                                    RichText::new("Finding your location...")
+                                        .small()
+                                        .color(subtle),
+                                );
                             });
                         }
                         Detect::Failed(e) => {
                             ui.label(
-                                RichText::new(format!("Couldn't set the time zone automatically: {e}"))
-                                    .small()
-                                    .color(BAD),
+                                RichText::new(format!(
+                                    "Couldn't set the time zone automatically: {e}"
+                                ))
+                                .small()
+                                .color(BAD),
                             );
                         }
                         Detect::Idle | Detect::Done => {}
                     }
                 }
-                ui.label(RichText::new(format!("Selected: {current_name}")).small().color(subtle));
+                ui.label(
+                    RichText::new(format!("Selected: {current_name}"))
+                        .small()
+                        .color(subtle),
+                );
             }
         });
 
@@ -1039,7 +1108,11 @@ fn offered_release(state: &UpdateState) -> Option<&Release> {
     }
 }
 
-fn update_banner(ui: &mut egui::Ui, release: &Release, state: &UpdateState) -> Option<UpdateAction> {
+fn update_banner(
+    ui: &mut egui::Ui,
+    release: &Release,
+    state: &UpdateState,
+) -> Option<UpdateAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         ui.label(icon(Icon::CircleArrowUp).size(18.0).color(ACCENT));
@@ -1085,9 +1158,13 @@ fn version_line(ui: &mut egui::Ui, state: &UpdateState) -> Option<UpdateAction> 
     let mut action = None;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format!("NTS Client {} ({})", Version::current(), update::COMMIT))
-                .small()
-                .weak(),
+            RichText::new(format!(
+                "NTS Client {} ({})",
+                Version::current(),
+                update::COMMIT
+            ))
+            .small()
+            .weak(),
         );
         let (text, can_check) = match state {
             UpdateState::Off => ("Local build, doesn't update itself".to_string(), false),
@@ -1095,7 +1172,9 @@ fn version_line(ui: &mut egui::Ui, state: &UpdateState) -> Option<UpdateAction> 
             UpdateState::Checking => ("Checking for updates...".into(), false),
             UpdateState::UpToDate => ("Up to date".into(), true),
             UpdateState::Available(_) | UpdateState::Installing(..) => (String::new(), false),
-            UpdateState::Failed { release: Some(_), .. } => (String::new(), false),
+            UpdateState::Failed {
+                release: Some(_), ..
+            } => (String::new(), false),
             UpdateState::Failed { error, .. } => (format!("Update check failed: {error}"), true),
         };
         if !text.is_empty() {

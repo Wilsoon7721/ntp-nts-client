@@ -3,6 +3,11 @@
 Each version's section here is also its GitHub release notes, and what the
 tray's "What's new" link opens.
 
+## 1.0.3
+
+- Starting with Windows now opens NTS Client quietly in the tray, as intended,
+  instead of showing its window and taking focus.
+
 ## 1.0.2
 
 - **Automatic time zone now works on desktop PCs.** The tray works out your
